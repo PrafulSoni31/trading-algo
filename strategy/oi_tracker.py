@@ -145,6 +145,9 @@ class OITrackerStrategy:
         for token in self.historical_data_dfs.keys():
             try:
                 new_candle = self.broker.historical_data(token, from_date, to_date, "minute")
+                if not new_candle:
+                    logger.warning("Historical data not available for Kotak Neo broker. OI Tracker will not run.")
+                    return
                 if new_candle:
                     new_df = pd.DataFrame(new_candle)
                     new_df['date'] = pd.to_datetime(new_df['date'])

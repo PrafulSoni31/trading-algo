@@ -164,6 +164,9 @@ class ZerodhaBroker(BrokerBase):
     def get_positions(self):
         return self.kite.positions()
 
+    def historical_data(self, instrument_token, from_date, to_date, interval):
+        return self.kite.historical_data(instrument_token, from_date, to_date, interval)
+
     def symbols_to_subscribe(self, symbols):
         self.symbols = symbols
 

@@ -25,19 +25,14 @@ class OITrackerStrategy:
             setattr(self, f'strat_var_{k}', v)
         # External dependencies
         self.broker = broker
-        self.symbol_initials = self.strat_var_symbol_initials
         self.broker.download_instruments()
-        self.instruments = self.broker.instruments_df[self.broker.instruments_df['tradingsymbol'].str.startswith(self.symbol_initials)]   # For Zerodha
-        if self.instruments.shape[0] == 0:
-            logger.error(f"No instruments found for {self.symbol_initials}")
-            logger.error(f"Instument {self.symbol_initials} not found. Please check the symbol initials")
-            return
+        self.instruments = self._get_relevant_instruments()
 
         self.strike_difference = None
 
         # Calculate and store strike difference for the option series
-        self.strike_difference = self._get_strike_difference(self.symbol_initials)
-        logger.info(f"Strike difference for {self.symbol_initials} is {self.strike_difference}")
+        self.strike_difference = self._get_strike_difference()
+        logger.info(f"Strike difference for is {self.strike_difference}")
 
         self._initialize_tables()
         pygame.mixer.init()
@@ -87,18 +82,25 @@ class OITrackerStrategy:
         self.call_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
         self.nifty_data = pd.DataFrame(columns=['Current NIFTY', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
 
-    def _get_strike_difference(self, symbol_initials):
+    def _get_relevant_instruments(self):
+        nifty_options = self.broker.instruments_df[
+            (self.broker.instruments_df['name'] == 'NIFTY') &
+            (self.broker.instruments_df['segment'] == 'NFO-OPT')
+        ]
+        nifty_options['expiry'] = pd.to_datetime(nifty_options['expiry'])
+        nifty_options = nifty_options[nifty_options['expiry'] > datetime.now()]
+        closest_expiry = nifty_options['expiry'].min()
+        return self.broker.instruments_df[self.broker.instruments_df['expiry'] == closest_expiry]
+
+    def _get_strike_difference(self):
         if self.strike_difference is not None:
             return self.strike_difference
 
         # Filter for CE instruments to calculate strike difference
-        ce_instruments = self.instruments[
-            self.instruments['tradingsymbol'].str.startswith(symbol_initials) &
-            self.instruments['tradingsymbol'].str.endswith('CE')
-        ]
+        ce_instruments = self.instruments[self.instruments['instrument_type'] == 'CE']
 
         if ce_instruments.shape[0] < 2:
-            logger.error(f"Not enough CE instruments found for {symbol_initials} to calculate strike difference")
+            logger.error(f"Not enough CE instruments found to calculate strike difference")
             return 0
         # Sort by strike
         ce_instruments_sorted = ce_instruments.sort_values('strike')
@@ -110,16 +112,6 @@ class OITrackerStrategy:
 
     def _get_atm_strike(self, current_price):
         return round(current_price / self.strike_difference) * self.strike_difference
-
-    def _get_historical_oi(self, instrument_token, from_date, to_date):
-        try:
-            records = self.broker.historical_data(instrument_token, from_date, to_date, "minute")
-            if records:
-                return records[-1]['oi']
-            return 0
-        except Exception as e:
-            logger.error(f"Error fetching historical OI for {instrument_token}: {e}")
-            return 0
 
     def on_ticks_update(self, ticks):
         """
@@ -139,24 +131,15 @@ class OITrackerStrategy:
 
         self.last_update_time = now
 
-        # Fetch last minute's candle for all instruments and append to our historical data
-        to_date = now.replace(second=0, microsecond=0)
-        from_date = to_date - timedelta(minutes=1)
-        for token in self.historical_data_dfs.keys():
-            try:
-                new_candle = self.broker.historical_data(token, from_date, to_date, "minute")
-                if not new_candle:
-                    logger.warning("Historical data not available for Kotak Neo broker. OI Tracker will not run.")
-                    return
-                if new_candle:
-                    new_df = pd.DataFrame(new_candle)
-                    new_df['date'] = pd.to_datetime(new_df['date'])
-                    new_df.set_index('date', inplace=True)
-                    self.historical_data_dfs[token] = pd.concat([self.historical_data_dfs[token], new_df])
-                    # Prune old data to keep the DataFrame size manageable
-                    self.historical_data_dfs[token] = self.historical_data_dfs[token].last('3H')
-            except Exception as e:
-                logger.error(f"Could not update historical data for token {token}: {e}")
+        # Update historical data with the latest tick
+        for tick in ticks:
+            token = tick['instrument_token']
+            if token in self.historical_data_dfs:
+                new_data = {'close': tick['last_price'], 'oi': tick.get('oi', 0)}
+                new_row = pd.DataFrame([new_data], index=[pd.to_datetime(tick['exchange_timestamp'])])
+                self.historical_data_dfs[token] = pd.concat([self.historical_data_dfs[token], new_row])
+                # Prune old data to keep the DataFrame size manageable
+                self.historical_data_dfs[token] = self.historical_data_dfs[token].last('3H')
 
         nifty_instrument = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]
         nifty_df = self.historical_data_dfs.get(nifty_instrument['instrument_token'])
@@ -230,14 +213,14 @@ class OITrackerStrategy:
                 time_val, time_unit = col_name.split(' ')
                 time_val = int(time_val)
 
-                if (time_unit == 'Min' and (
-                   (time_val == 3 and percent > 10) or \
-                   (time_val == 5 and percent > 12) or \
-                   (time_val == 10 and percent > 15) or \
-                   (time_val == 15 and percent > 30) or \
-                   (time_val == 30 and percent > 30))) or \
-                   (time_unit == 'Hr' and time_val == 3 and percent > 100):
+                thresholds = self.strat_var_color_thresholds
+
+                if time_unit == 'Hr':
+                    time_val = time_val * 60
+
+                if time_val in thresholds and percent > thresholds[time_val]:
                     return True
+
             except (ValueError, IndexError):
                 pass
         return False
@@ -288,3 +271,79 @@ class OITrackerStrategy:
             except pygame.error:
                 logger.error("Could not play alert sound. Make sure 'alert.wav' or 'alert.mp3' is in the root directory.")
             logger.warning("ALERT: More than 30% of cells are red!")
+
+if __name__ == "__main__":
+    import time
+    import yaml
+    import sys
+    import argparse
+    from dispatcher import DataDispatcher
+    from brokers.zerodha import ZerodhaBroker
+    from logger import logger
+    from queue import Queue
+    import traceback
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    import logging
+    logger.setLevel(logging.INFO)
+
+    config_file = os.path.join(os.path.dirname(__file__), "configs/oi_tracker.yml")
+    with open(config_file, 'r') as f:
+        config = yaml.safe_load(f)['default']
+
+    broker = ZerodhaBroker(without_totp=False)
+
+    dispatcher = DataDispatcher()
+    dispatcher.register_main_queue(Queue())
+
+    def on_ticks(ws, ticks):
+        logger.debug("Received ticks: {}".format(ticks))
+        dispatcher.dispatch(ticks)
+
+    def on_connect(ws, response):
+        logger.info("Websocket connected successfully: {}".format(response))
+        ws.subscribe(instrument_tokens)
+        ws.set_mode(ws.MODE_FULL, instrument_tokens)
+
+    broker.on_ticks = on_ticks
+    broker.on_connect = on_connect
+
+    strategy = OITrackerStrategy(broker, config)
+
+    # Get all instrument tokens to subscribe
+    instrument_tokens = [strategy.instruments[strategy.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]['instrument_token']]
+    atm_strike = strategy._get_atm_strike(broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price'])
+    strike_prices = [atm_strike + i * strategy.strike_difference for i in range(-2, 3)]
+    for strike in strike_prices:
+        put_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'PE')]
+        call_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'CE')]
+        if not put_instrument.empty:
+            instrument_tokens.append(put_instrument.iloc[0]['instrument_token'])
+        if not call_instrument.empty:
+            instrument_tokens.append(call_instrument.iloc[0]['instrument_token'])
+
+    broker.connect_websocket()
+
+    try:
+        while True:
+            try:
+                tick_data = dispatcher._main_queue.get()
+                strategy.on_ticks_update(tick_data)
+
+            except KeyboardInterrupt:
+                logger.info("SHUTDOWN REQUESTED - Stopping strategy...")
+                break
+
+            except Exception as tick_error:
+                logger.error(f"Error processing tick data: {tick_error}")
+                traceback.print_exc()
+                continue
+
+    except Exception as fatal_error:
+        logger.error("FATAL ERROR in main trading loop:")
+        logger.error(f"Error: {fatal_error}")
+        traceback.print_exc()
+
+    finally:
+        logger.info("STRATEGY SHUTDOWN COMPLETE")

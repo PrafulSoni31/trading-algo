@@ -1,0 +1,45 @@
+# OI Tracker Strategy Configuration
+# ===================================
+#
+# This configuration file defines parameters for the OI Tracker Strategy, which monitors
+# Open Interest (OI) changes for NIFTY options.
+
+default:
+  # ========================================================================
+  # CORE PARAMETERS
+  # ========================================================================
+
+  # Underlying index symbol for price tracking
+  index_symbol: "NSE:NIFTY 50"
+
+  # ========================================================================
+  # STRATEGY PARAMETERS
+  # ========================================================================
+
+  # Number of strikes above and below the At-The-Money (ATM) strike to track
+  strike_range: 2
+
+  # Time intervals (in minutes) to calculate OI changes for
+  time_intervals: [3, 5, 10, 15, 30, 180]
+
+  # ========================================================================
+  # ALERT PARAMETERS
+  # ========================================================================
+
+  # Threshold for the percentage of red cells to trigger an alert
+  alert_threshold: 0.3
+
+  # Path to the alert sound file (e.g., alert.wav or alert.mp3)
+  alert_sound: "alert.wav"
+
+  # ========================================================================
+  # COLOR CODING THRESHOLDS
+  # ========================================================================
+
+  color_thresholds:
+    3: 10   # > 10% change in 3 minutes
+    5: 12   # > 12% change in 5 minutes
+    10: 15  # > 15% change in 10 minutes
+    15: 30  # > 30% change in 15 minutes
+    30: 30  # > 30% change in 30 minutes
+    180: 100 # > 100% change in 3 hours

@@ -62,10 +62,17 @@ class ZerodhaBroker(BrokerBase):
 
         # Step 2: TwoFA
         twofa_url = "https://kite.zerodha.com/api/twofa"
+        try:
+            totp = pyotp.TOTP(totp_secret).now()
+        except Exception as e:
+            logger.error(f"Error generating TOTP: {e}")
+            logger.error("Please ensure that the BROKER_TOTP_KEY in your .env file is a valid Base32 encoded string.")
+            sys.exit(1)
+
         twofa_payload = {
             "user_id": broker_id,
             "request_id": request_id,
-            "twofa_value": pyotp.TOTP(totp_secret).now(),
+            "twofa_value": totp,
             # "twofa_type": "totp",
         }
         twofa_resp = session.post(twofa_url, data=twofa_payload)

@@ -27,6 +27,10 @@ class OITrackerStrategy:
         self.broker = broker
         self.broker.download_instruments()
         self.instruments = self._get_relevant_instruments()
+        if self.instruments.empty:
+            logger.error("Could not find any relevant NIFTY instruments to track.")
+            logger.error("This can happen if the script is run on a day when no options are traded (e.g., weekend/holiday).")
+            sys.exit(1)
 
         self.strike_difference = None
 
@@ -44,7 +48,11 @@ class OITrackerStrategy:
         now = datetime.now()
         from_date = now - timedelta(hours=3)
 
-        nifty_instrument = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]
+        nifty_instrument_df = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50']
+        if nifty_instrument_df.empty:
+            logger.error("Could not find NIFTY 50 instrument.")
+            sys.exit(1)
+        nifty_instrument = nifty_instrument_df.iloc[0]
         all_instruments = [nifty_instrument]
 
         # This is a bit inefficient to get the ATM strike here, but we need it to get the relevant instruments.
@@ -87,10 +95,27 @@ class OITrackerStrategy:
             (self.broker.instruments_df['name'] == 'NIFTY') &
             (self.broker.instruments_df['segment'] == 'NFO-OPT')
         ]
-        nifty_options['expiry'] = pd.to_datetime(nifty_options['expiry'])
-        nifty_options = nifty_options[nifty_options['expiry'] > datetime.now()]
-        closest_expiry = nifty_options['expiry'].min()
-        return self.broker.instruments_df[self.broker.instruments_df['expiry'] == closest_expiry]
+        nifty_options['expiry'] = pd.to_datetime(nifty_options['expiry']).dt.date
+
+        # Find the closest expiry date that is not in the past
+        future_expiries = nifty_options[nifty_options['expiry'] >= datetime.now().date()]
+        if future_expiries.empty:
+            return pd.DataFrame() # Return empty if no future expiries found
+
+        closest_expiry = future_expiries['expiry'].min()
+
+        # Also include the NIFTY 50 index instrument itself
+        nifty_index = self.broker.instruments_df[
+            (self.broker.instruments_df['tradingsymbol'] == 'NIFTY 50') &
+            (self.broker.instruments_df['instrument_type'] == 'EQ')
+        ]
+
+        relevant_options = self.broker.instruments_df[
+            (self.broker.instruments_df['expiry'] == closest_expiry) &
+            (self.broker.instruments_df['name'] == 'NIFTY')
+        ]
+
+        return pd.concat([relevant_options, nifty_index])
 
     def _get_strike_difference(self):
         if self.strike_difference is not None:
@@ -141,7 +166,11 @@ class OITrackerStrategy:
                 # Prune old data to keep the DataFrame size manageable
                 self.historical_data_dfs[token] = self.historical_data_dfs[token].last('3H')
 
-        nifty_instrument = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]
+        nifty_instrument_df = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50']
+        if nifty_instrument_df.empty:
+            logger.error("Could not find NIFTY 50 instrument.")
+            return
+        nifty_instrument = nifty_instrument_df.iloc[0]
         nifty_df = self.historical_data_dfs.get(nifty_instrument['instrument_token'])
         if nifty_df is None or nifty_df.empty:
             return

@@ -13,6 +13,7 @@ if PROJECT_ROOT not in sys.path:
 import yaml
 import pandas as pd
 import pygame
+from termcolor import colored
 from logger import logger
 from dispatcher import DataDispatcher
 from brokers.zerodha import ZerodhaBroker
@@ -60,6 +61,12 @@ class OITrackerStrategy:
             pygame.mixer.init()
         except Exception:
             pass
+
+        # Initialize the three tables
+        self.put_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
+        self.call_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
+        self.nifty_data = pd.DataFrame(columns=['Current NIFTY', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
+
 
         self._prepare_history_and_subscriptions()
 
@@ -202,73 +209,148 @@ class OITrackerStrategy:
                 return None
             return int(v.iloc[-1])
 
-        for token, latest_oi in self._live_oi.items():
-            meta = self._token_meta.get(token) or {}
-            itype = meta.get("itype")
-            strike = meta.get("strike")
-            if itype not in ("CE", "PE"):
-                continue  # show only options
+        current_price = self.broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price']
+        atm_strike = self._get_atm_strike(current_price)
+        strikes = [atm_strike + i * self.strike_difference for i in range(-2, 3)]
 
-            row = {
-                "Strike": strike,
-                "Type": itype,
-                "Current OI": latest_oi,
-            }
+        # Clear the tables before populating
+        self.put_oi_data = self.put_oi_data.iloc[0:0]
+        self.call_oi_data = self.call_oi_data.iloc[0:0]
+        self.nifty_data = self.nifty_data.iloc[0:0]
 
-            for label, delta_t in windows.items():
-                past_oi = _oi_at_or_before(token, now - delta_t)
-                row[label] = (latest_oi - past_oi) if (past_oi is not None) else None
+        for strike in strikes:
+            # Find the put and call tokens for the current strike
+            pe_token = next((t for t, m in self._token_meta.items() if m['strike'] == strike and m['itype'] == 'PE'), None)
+            ce_token = next((t for t, m in self._token_meta.items() if m['strike'] == strike and m['itype'] == 'CE'), None)
 
-            rows.append(row)
+            # --- Populate Put Table ---
+            if pe_token and pe_token in self._live_oi:
+                latest_oi = self._live_oi[pe_token]
+                row = {"Strike": strike, "Current OI": latest_oi}
+                for label, delta_t in windows.items():
+                    past_oi = _oi_at_or_before(pe_token, now - delta_t)
+                    row[label] = (latest_oi, past_oi) # Store tuple for later processing
+                self.put_oi_data.loc[strike] = row
 
-        if not rows:
-            return
+            # --- Populate Call Table ---
+            if ce_token and ce_token in self._live_oi:
+                latest_oi = self._live_oi[ce_token]
+                row = {"Strike": strike, "Current OI": latest_oi}
+                for label, delta_t in windows.items():
+                    past_oi = _oi_at_or_before(ce_token, now - delta_t)
+                    row[label] = (latest_oi, past_oi) # Store tuple for later processing
+                self.call_oi_data.loc[strike] = row
 
-        df_rows = pd.DataFrame(rows)
-        # Coerce deltas to numeric, treat missing as 0 so .abs() won’t fail
-        for col in ["3 Min","5 Min","10 Min","15 Min","30 Min","3 Hr"]:
-            if col in df_rows.columns:
-                df_rows[col] = pd.to_numeric(df_rows[col], errors="coerce").fillna(0)
+        # --- Populate NIFTY Table ---
+        nifty_row = {"Current NIFTY": current_price}
+        for label, delta_t in windows.items():
+            past_price = _oi_at_or_before(self._nifty_token, now - delta_t) # Reusing oi history func for price
+            nifty_row[label] = (current_price, past_price)
+        self.nifty_data.loc[0] = nifty_row
 
-        # Stable sort by 5m then 15m magnitude
-        df_rows["_sort"] = df_rows["5 Min"].abs()
-        df_rows["_sort2"] = df_rows["15 Min"].abs()
-        df_rows.sort_values(
-            by=["_sort", "_sort2", "Strike", "Type"],
-            ascending=[False, False, True, True],
-            inplace=True
-        )
-        df_rows.drop(columns=["_sort", "_sort2"], inplace=True)
+        # NOTE: The rest of the original function that prints tables is now obsolete
+        # and will be replaced by the _print_tables and _check_alerts methods.
+        # This part of the code will be removed in a later step.
 
-        # pretty print top 10 compact
-        to_show = df_rows.head(10).copy()
-        for col in ["3 Min","5 Min","10 Min","15 Min","30 Min","3 Hr"]:
-            if col in to_show.columns:
-                to_show[col] = to_show[col].apply(lambda v: "" if v is None else int(v))
+        # Now apply the formatting to the tables
+        self._apply_formatting()
 
-        if not hasattr(self, "_last_print") or (now - getattr(self, "_last_print")).total_seconds() > 10:
-            logger.info("OI d (top by 5m): Strike  Type | Cur  d3m  d5m  d10m  d15m  d30m  d3h")
-            self._last_print = now
+        # Print the tables
+        self._print_tables()
 
-        for _, r in to_show.iterrows():
-            logger.info(
-                f"OI d: {str(r['Strike']).rjust(6)}  {r['Type']:>3} | "
-                f"{str(r['Current OI']).rjust(6)}  "
-                f"{str(r.get('3 Min','')).rjust(4)}  "
-                f"{str(r.get('5 Min','')).rjust(4)}  "
-                f"{str(r.get('10 Min','')).rjust(5)}  "
-                f"{str(r.get('15 Min','')).rjust(5)}  "
-                f"{str(r.get('30 Min','')).rjust(5)}  "
-                f"{str(r.get('3 Hr','')).rjust(5)}"
-            )
+        # Check for alerts
+        self._check_alerts()
 
-        # Optional: save snapshot every 60s
-        # if getattr(self, "_last_csv_at", None) is None or (now - self._last_csv_at).total_seconds() >= 60:
-        #     snap_path = os.path.join(PROJECT_ROOT, "oi_snapshot.csv")
-        #     df_rows.sort_values(["Strike","Type"], inplace=True)
-        #     df_rows.to_csv(snap_path, index=False)
-        #     self._last_csv_at = now
-        #     logger.info(f"Saved OI snapshot -> {snap_path}")
+    def _format_cell(self, value_tuple):
+        """Formats a (current, past) tuple into the desired string format."""
+        if not isinstance(value_tuple, tuple) or len(value_tuple) != 2:
+            return "N/A"
+
+        current, past = value_tuple
+        if past is None or past == 0:
+            return "N/A"
+
+        absolute_change = current - past
+        percent_change = (absolute_change / past) * 100
+
+        return f"{percent_change:.2f}% ({absolute_change})"
+
+    def _apply_formatting(self):
+        """Applies the cell formatting to all three tables."""
+        for col in ['3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr']:
+            if col in self.put_oi_data.columns:
+                self.put_oi_data[col] = self.put_oi_data[col].apply(self._format_cell)
+            if col in self.call_oi_data.columns:
+                self.call_oi_data[col] = self.call_oi_data[col].apply(self._format_cell)
+            if col in self.nifty_data.columns:
+                self.nifty_data[col] = self.nifty_data[col].apply(self._format_cell)
+        # The old printing logic is now removed.
+
+    def _is_red(self, val, col_name):
+        if isinstance(val, str) and '%' in val:
+            try:
+                percent = float(val.split('%')[0])
+                time_val, time_unit = col_name.split(' ')
+                time_val = int(time_val)
+
+                thresholds = self.cfg.get("color_thresholds", {})
+
+                if time_unit == 'Hr':
+                    time_val = time_val * 60
+
+                if str(time_val) in thresholds and percent > thresholds[str(time_val)]:
+                    return True
+
+            except (ValueError, IndexError):
+                pass
+        return False
+
+    def _print_tables(self):
+
+        def color_code_df(df):
+            df_colored = df.copy()
+            for col in ['3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr']:
+                if col in df_colored.columns:
+                    df_colored[col] = df_colored[col].apply(lambda x: colored(x, 'red') if self._is_red(x, col) else x)
+            return df_colored
+
+        # Clear console before printing
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        print("--- Put OI Data ---")
+        print(color_code_df(self.put_oi_data).to_string())
+
+        print("\n--- Call OI Data ---")
+        print(color_code_df(self.call_oi_data).to_string())
+
+        print("\n--- NIFTY Data ---")
+        print(self.nifty_data.to_string())
+
+    def _check_alerts(self):
+
+        def count_red_cells(df):
+            count = 0
+            for col in df.columns:
+                if 'Min' in col or 'Hr' in col:
+                    for val in df[col]:
+                        if self._is_red(val, col):
+                            count += 1
+            return count
+
+        put_red_cells = count_red_cells(self.put_oi_data)
+        call_red_cells = count_red_cells(self.call_oi_data)
+
+        total_cells_per_table = (len(self.put_oi_data.index) * 6) # 6 time columns
+
+        if total_cells_per_table > 0 and ((put_red_cells / total_cells_per_table) > 0.3 or (call_red_cells / total_cells_per_table) > 0.3):
+            try:
+                alert_sound = self.cfg.get("alert_sound", "alert.wav")
+                pygame.mixer.music.load(alert_sound)
+                pygame.mixer.music.play()
+            except pygame.error:
+                logger.error(f"Could not play alert sound. Make sure '{alert_sound}' is in the root directory.")
+            logger.warning("ALERT: More than 30% of cells in one of the tables are red!")
+
 
 def main():
     # Load YAML config

@@ -1,239 +1,290 @@
 import os
 import sys
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from datetime import datetime, timedelta
+from queue import Queue
+from collections import deque, defaultdict
+
+# --- Make project root importable ---
+CURR_DIR = os.path.dirname(__file__)
+PROJECT_ROOT = os.path.abspath(os.path.join(CURR_DIR, ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 import yaml
-from logger import logger
-
 import pandas as pd
-import time
-from datetime import datetime, timedelta
 import pygame
 from termcolor import colored
+from logger import logger
+from dispatcher import DataDispatcher
+from brokers.zerodha import ZerodhaBroker
+
+CONFIG_PATH = os.path.join(CURR_DIR, "configs", "oi_tracker.yml")
+
+def _to_int(x):
+    """Ensure plain Python int for Kite ticker methods."""
+    try:
+        return int(x)
+    except Exception:
+        return int(float(x))
 
 class OITrackerStrategy:
-    """
-    OI Tracker Strategy
-
-    This strategy tracks the change in Open Interest (OI) for ATM and 2 slightly ITM and 2 slightly OTM options,
-    for both call and put options.
-    """
-
-    def __init__(self, broker, config):
-        # Assign config values as instance variables with 'strat_var_' prefix
-        for k, v in config.items():
-            setattr(self, f'strat_var_{k}', v)
-        # External dependencies
+    """Tracks OI deltas across selected NIFTY option strikes."""
+    def __init__(self, broker: ZerodhaBroker, cfg: dict):
         self.broker = broker
-        self.broker.download_instruments()
-        self.instruments = self._get_relevant_instruments()
-        if self.instruments.empty:
-            logger.error("Could not find any relevant NIFTY instruments to track.")
-            logger.error("This can happen if the script is run on a day when no options are traded (e.g., weekend/holiday).")
-            sys.exit(1)
+        self.cfg = cfg
+        self.exchange = cfg.get("exchange", "NFO")
+        self.symbol = cfg.get("symbol", "NIFTY")
+        self.strike_difference = float(cfg.get("strike_difference", 50))
+        self.lot_size = int(cfg.get("lot_size", 50))
+        self.refresh_interval = int(cfg.get("refresh_interval", 1))
 
-        self.strike_difference = None
+        instruments_csv = cfg.get("instruments_csv", os.path.join(PROJECT_ROOT, "instruments.csv"))
+        if not os.path.exists(instruments_csv):
+            raise FileNotFoundError(
+                f"Missing instruments file: {instruments_csv}. "
+                f"Set 'instruments_csv' in {CONFIG_PATH}"
+            )
+        self.instruments = pd.read_csv(instruments_csv)
 
-        # Calculate and store strike difference for the option series
-        self.strike_difference = self._get_strike_difference()
         logger.info(f"Strike difference for is {self.strike_difference}")
 
-        self._initialize_tables()
-        pygame.mixer.init()
-        self.last_update_time = None
+        # live OI store per token and rolling buffer of (timestamp, oi)
+        self._live_oi = {}                      # token -> latest OI
+        self._oi_buffers = defaultdict(deque)   # token -> deque[(ts, oi)]
+        self._buf_maxlen = 2000                 # ~enough for a few hours at 1s-5s ticks
+
+        # token metadata -> (strike, type) to format the tables easily
+        self._token_meta = {}                   # token -> {"strike": int|None, "itype": "CE"/"PE"/"IDX"}
+
         self.historical_data_dfs = {}
-        self._populate_historical_data()
-
-    def _populate_historical_data(self):
-        now = datetime.now()
-        from_date = now - timedelta(hours=3)
-
-        nifty_instrument_df = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50']
-        if nifty_instrument_df.empty:
-            logger.error("Could not find NIFTY 50 instrument.")
-            sys.exit(1)
-        nifty_instrument = nifty_instrument_df.iloc[0]
-        all_instruments = [nifty_instrument]
-
-        # This is a bit inefficient to get the ATM strike here, but we need it to get the relevant instruments.
-        # This assumes the app starts during market hours. A more robust solution would handle this better.
         try:
-            current_price = self.broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price']
-        except Exception as e:
-            logger.error(f"Could not fetch initial NIFTY price: {e}")
-            # Fallback to a reasonable default if market is closed, etc.
-            current_price = self.instruments['strike'].median()
-
-        atm_strike = self._get_atm_strike(current_price)
-        strike_prices = [atm_strike + i * self.strike_difference for i in range(-2, 3)]
-
-        for strike in strike_prices:
-            put_instrument = self.instruments[(self.instruments['strike'] == strike) & (self.instruments['instrument_type'] == 'PE')]
-            call_instrument = self.instruments[(self.instruments['strike'] == strike) & (self.instruments['instrument_type'] == 'CE')]
-            if not put_instrument.empty:
-                all_instruments.append(put_instrument.iloc[0])
-            if not call_instrument.empty:
-                all_instruments.append(call_instrument.iloc[0])
-
-        for instrument in all_instruments:
-            token = instrument['instrument_token']
-            df = pd.DataFrame(self.broker.historical_data(token, from_date, now, "minute"))
-            if not df.empty:
-                df['date'] = pd.to_datetime(df['date'])
-                df.set_index('date', inplace=True)
-                self.historical_data_dfs[token] = df
-
-        logger.info("Initial historical data populated.")
-
-    def _initialize_tables(self):
+            pygame.mixer.init()
+        except Exception:
+            pass
+        
+        # Initialize the three tables
         self.put_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
         self.call_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
         self.nifty_data = pd.DataFrame(columns=['Current NIFTY', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
 
-    def _get_relevant_instruments(self):
-        nifty_options = self.broker.instruments_df[
-            (self.broker.instruments_df['name'] == 'NIFTY') &
-            (self.broker.instruments_df['segment'] == 'NFO-OPT')
-        ]
-        nifty_options['expiry'] = pd.to_datetime(nifty_options['expiry']).dt.date
 
-        # Find the closest expiry date that is not in the past
-        future_expiries = nifty_options[nifty_options['expiry'] >= datetime.now().date()]
-        if future_expiries.empty:
-            return pd.DataFrame() # Return empty if no future expiries found
+        self._prepare_history_and_subscriptions()
 
-        closest_expiry = future_expiries['expiry'].min()
+    def _prepare_history_and_subscriptions(self):
+        now = datetime.now()
+        from_date = now - timedelta(hours=3)
 
-        # Also include the NIFTY 50 index instrument itself
-        nifty_index = self.broker.instruments_df[
-            (self.broker.instruments_df['tradingsymbol'] == 'NIFTY 50') &
-            (self.broker.instruments_df['instrument_type'] == 'EQ')
-        ]
+        # --- NIFTY 50 token ---
+        nifty_df = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50']
+        if nifty_df.empty:
+            raise RuntimeError("NIFTY 50 instrument not found in instruments.csv")
+        self._nifty_token = _to_int(nifty_df.iloc[0]['instrument_token'])
 
-        relevant_options = self.broker.instruments_df[
-            (self.broker.instruments_df['expiry'] == closest_expiry) &
-            (self.broker.instruments_df['name'] == 'NIFTY')
-        ]
+        # --- ATM ±2 strikes ---
+        try:
+            current_price = self.broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price']
+        except Exception as e:
+            logger.error(f"Could not fetch initial NIFTY price: {e}")
+            current_price = float(nifty_df.iloc[0].get('last_price', 24000.0))
 
-        return pd.concat([relevant_options, nifty_index])
+        atm = self._get_atm_strike(current_price)
+        strikes = [atm + i * self.strike_difference for i in range(-2, 3)]
 
-    def _get_strike_difference(self):
-        if self.strike_difference is not None:
-            return self.strike_difference
+        tokens = [self._nifty_token]
 
-        # Filter for CE instruments to calculate strike difference
-        ce_instruments = self.instruments[self.instruments['instrument_type'] == 'CE']
+        for strike in strikes:
+            pe = self.instruments[
+                (self.instruments['strike'] == strike) &
+                (self.instruments['instrument_type'] == 'PE')
+            ]
+            ce = self.instruments[
+                (self.instruments['strike'] == strike) &
+                (self.instruments['instrument_type'] == 'CE')
+            ]
+            if not pe.empty:
+                tokens.append(_to_int(pe.iloc[0]['instrument_token']))
+            if not ce.empty:
+                tokens.append(_to_int(ce.iloc[0]['instrument_token']))
 
-        if ce_instruments.shape[0] < 2:
-            logger.error(f"Not enough CE instruments found to calculate strike difference")
-            return 0
-        # Sort by strike
-        ce_instruments_sorted = ce_instruments.sort_values('strike')
-        # Take the top 2
-        top2 = ce_instruments_sorted.head(2)
-        # Calculate the difference
-        self.strike_difference = abs(top2.iloc[1]['strike'] - top2.iloc[0]['strike'])
-        return self.strike_difference
+        self._option_tokens = [t for t in tokens if t != self._nifty_token]
 
-    def _get_atm_strike(self, current_price):
-        return round(current_price / self.strike_difference) * self.strike_difference
+        # --- Build token metadata for quick lookup in on_ticks_update ---
+        self._token_meta[self._nifty_token] = {"strike": None, "itype": "IDX"}
+        for t in self._option_tokens:
+            row = self.instruments[self.instruments["instrument_token"] == t]
+            strike = None
+            itype = None
+            if not row.empty:
+                try:
+                    strike = int(float(row.iloc[0].get("strike", 0)))
+                except Exception:
+                    strike = None
+                itype = row.iloc[0].get("instrument_type") or None
+            self._token_meta[int(t)] = {"strike": strike, "itype": itype}
+
+        # --- History preload ---
+        all_needed = [self._nifty_token] + self._option_tokens
+        for token in all_needed:
+            try:
+                df = pd.DataFrame(self.broker.historical_data(token, from_date, now, "minute"))
+            except Exception as e:
+                logger.error(f"historical_data failed for token {token}: {e}")
+                df = pd.DataFrame()
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                df.set_index('date', inplace=True)
+                # Keep only OI if present; otherwise create it later
+                cols = df.columns
+                if "oi" not in cols and "oi" not in df:
+                    # make a single-column df to append to later
+                    df = df[[]]
+                self.historical_data_dfs[_to_int(token)] = df
+
+        logger.info("Initial historical data populated.")
+
+    def _get_atm_strike(self, price: float) -> int:
+        return int(round(price / self.strike_difference) * self.strike_difference)
 
     def on_ticks_update(self, ticks):
         """
-        Main strategy execution method called on each tick update
-
-        Args:
-            ticks (dict): Market data containing 'last_price' and other tick information
+        Consume incoming FULL/LTP ticks, update live OI, extend minute history, and
+        print OI deltas for CE/PE grouped by strike over time windows.
         """
-
         now = datetime.now()
-        if self.last_update_time and (now - self.last_update_time).total_seconds() < 60:
-            return
 
-        # Align to the minute
-        if self.last_update_time and self.last_update_time.minute == now.minute:
-            return
+        # 1) ingest ticks
+        updated_tokens = set()
+        for tk in ticks:
+            token = int(tk.get("instrument_token"))
+            oi = tk.get("oi")
+            if oi is None:
+                # index LTP tick will not have OI; skip
+                continue
+            self._live_oi[token] = int(oi)
+            buf = self._oi_buffers[token]
+            buf.append((now, int(oi)))
+            if len(buf) > self._buf_maxlen:
+                buf.popleft()
+            updated_tokens.add(token)
 
-        self.last_update_time = now
+        if not updated_tokens:
+            return  # nothing to aggregate
 
-        # Update historical data with the latest tick
-        for tick in ticks:
-            token = tick['instrument_token']
-            if token in self.historical_data_dfs:
-                new_data = {'close': tick['last_price'], 'oi': tick.get('oi', 0)}
-                new_row = pd.DataFrame([new_data], index=[pd.to_datetime(tick['exchange_timestamp'])])
-                self.historical_data_dfs[token] = pd.concat([self.historical_data_dfs[token], new_row])
-                # Prune old data to keep the DataFrame size manageable
-                self.historical_data_dfs[token] = self.historical_data_dfs[token].last('3H')
-
-        nifty_instrument_df = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50']
-        if nifty_instrument_df.empty:
-            logger.error("Could not find NIFTY 50 instrument.")
-            return
-        nifty_instrument = nifty_instrument_df.iloc[0]
-        nifty_df = self.historical_data_dfs.get(nifty_instrument['instrument_token'])
-        if nifty_df is None or nifty_df.empty:
-            return
-
-        current_price = nifty_df['close'].iloc[-1]
-        atm_strike = self._get_atm_strike(current_price)
-
-        strike_prices = [atm_strike + i * self.strike_difference for i in range(-2, 3)]
-
-        for strike in strike_prices:
-            put_instrument = self.instruments[(self.instruments['strike'] == strike) & (self.instruments['instrument_type'] == 'PE')]
-            call_instrument = self.instruments[(self.instruments['strike'] == strike) & (self.instruments['instrument_type'] == 'CE')]
-
-            if not put_instrument.empty:
-                put_instrument_token = put_instrument.iloc[0]['instrument_token']
-                put_df = self.historical_data_dfs.get(put_instrument_token)
-                if put_df is not None and not put_df.empty:
-                    current_put_oi = put_df['oi'].iloc[-1]
-                    self.put_oi_data.loc[strike, 'Strike'] = strike
-                    self.put_oi_data.loc[strike, 'Current OI'] = current_put_oi
-
-                    for t in [3, 5, 10, 15, 30, 180]:
-                        past_time = now - timedelta(minutes=t)
-                        past_oi_series = put_df['oi'].asof(past_time)
-                        if not pd.isna(past_oi_series) and past_oi_series > 0:
-                            change_percent = ((current_put_oi - past_oi_series) / past_oi_series) * 100
-                            change_absolute = current_put_oi - past_oi_series
-                            self.put_oi_data.loc[strike, f'{t} Min' if t < 60 else f'{t//60} Hr'] = f"{change_percent:.2f}% ({change_absolute})"
-                        else:
-                            self.put_oi_data.loc[strike, f'{t} Min' if t < 60 else f'{t//60} Hr'] = "N/A"
-
-            if not call_instrument.empty:
-                call_instrument_token = call_instrument.iloc[0]['instrument_token']
-                call_df = self.historical_data_dfs.get(call_instrument_token)
-                if call_df is not None and not call_df.empty:
-                    current_call_oi = call_df['oi'].iloc[-1]
-                    self.call_oi_data.loc[strike, 'Strike'] = strike
-                    self.call_oi_data.loc[strike, 'Current OI'] = current_call_oi
-
-                    for t in [3, 5, 10, 15, 30, 180]:
-                        past_time = now - timedelta(minutes=t)
-                        past_oi_series = call_df['oi'].asof(past_time)
-                        if not pd.isna(past_oi_series) and past_oi_series > 0:
-                            change_percent = ((current_call_oi - past_oi_series) / past_oi_series) * 100
-                            change_absolute = current_call_oi - past_oi_series
-                            self.call_oi_data.loc[strike, f'{t} Min' if t < 60 else f'{t//60} Hr'] = f"{change_percent:.2f}% ({change_absolute})"
-                        else:
-                            self.call_oi_data.loc[strike, f'{t} Min' if t < 60 else f'{t//60} Hr'] = "N/A"
-
-        self.nifty_data.loc[0, 'Current NIFTY'] = current_price
-        for t in [3, 5, 10, 15, 30, 180]:
-            past_time = now - timedelta(minutes=t)
-            past_price_series = nifty_df['close'].asof(past_time)
-            if not pd.isna(past_price_series):
-                past_price = past_price_series
-                change_percent = ((current_price - past_price) / past_price) * 100
-                change_absolute = current_price - past_price
-                self.nifty_data.loc[0, f'{t} Min' if t < 60 else f'{t//60} Hr'] = f"{change_percent:.2f}% ({change_absolute})"
+        # 2) ensure minute history tracks along
+        for token in updated_tokens:
+            df = self.historical_data_dfs.get(token)
+            if df is None or df.empty:
+                self.historical_data_dfs[token] = pd.DataFrame({"oi": [self._live_oi[token]]}, index=[now])
             else:
-                self.nifty_data.loc[0, f'{t} Min' if t < 60 else f'{t//60} Hr'] = "N/A"
+                last_idx = df.index[-1] if len(df.index) else None
+                if last_idx is None or (now - last_idx).total_seconds() >= 55:
+                    # If 'oi' column isn't there yet, create it
+                    if "oi" not in df.columns:
+                        df["oi"] = None
+                    df.loc[now, "oi"] = self._live_oi[token]
+                    cutoff = now - timedelta(hours=4)
+                    self.historical_data_dfs[token] = df[df.index >= cutoff]
 
+        # 3) compute deltas for windows using history where possible
+        windows = {
+            "3 Min": timedelta(minutes=3),
+            "5 Min": timedelta(minutes=5),
+            "10 Min": timedelta(minutes=10),
+            "15 Min": timedelta(minutes=15),
+            "30 Min": timedelta(minutes=30),
+            "3 Hr": timedelta(hours=3),
+        }
+
+        rows = []
+
+        def _oi_at_or_before(token: int, ts: datetime) -> int | None:
+            df = self.historical_data_dfs.get(token)
+            if df is None or df.empty or "oi" not in df.columns:
+                return None
+            sub = df.loc[:ts]
+            if sub.empty or "oi" not in sub:
+                return None
+            v = sub["oi"].dropna()
+            if v.empty:
+                return None
+            return int(v.iloc[-1])
+
+        current_price = self.broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price']
+        atm_strike = self._get_atm_strike(current_price)
+        strikes = [atm_strike + i * self.strike_difference for i in range(-2, 3)]
+        
+        # Clear the tables before populating
+        self.put_oi_data = self.put_oi_data.iloc[0:0]
+        self.call_oi_data = self.call_oi_data.iloc[0:0]
+        self.nifty_data = self.nifty_data.iloc[0:0]
+
+        for strike in strikes:
+            # Find the put and call tokens for the current strike
+            pe_token = next((t for t, m in self._token_meta.items() if m['strike'] == strike and m['itype'] == 'PE'), None)
+            ce_token = next((t for t, m in self._token_meta.items() if m['strike'] == strike and m['itype'] == 'CE'), None)
+
+            # --- Populate Put Table ---
+            if pe_token and pe_token in self._live_oi:
+                latest_oi = self._live_oi[pe_token]
+                row = {"Strike": strike, "Current OI": latest_oi}
+                for label, delta_t in windows.items():
+                    past_oi = _oi_at_or_before(pe_token, now - delta_t)
+                    row[label] = (latest_oi, past_oi) # Store tuple for later processing
+                self.put_oi_data.loc[strike] = row
+
+            # --- Populate Call Table ---
+            if ce_token and ce_token in self._live_oi:
+                latest_oi = self._live_oi[ce_token]
+                row = {"Strike": strike, "Current OI": latest_oi}
+                for label, delta_t in windows.items():
+                    past_oi = _oi_at_or_before(ce_token, now - delta_t)
+                    row[label] = (latest_oi, past_oi) # Store tuple for later processing
+                self.call_oi_data.loc[strike] = row
+
+        # --- Populate NIFTY Table ---
+        nifty_row = {"Current NIFTY": current_price}
+        for label, delta_t in windows.items():
+            past_price = _oi_at_or_before(self._nifty_token, now - delta_t) # Reusing oi history func for price
+            nifty_row[label] = (current_price, past_price)
+        self.nifty_data.loc[0] = nifty_row
+        
+        # NOTE: The rest of the original function that prints tables is now obsolete
+        # and will be replaced by the _print_tables and _check_alerts methods.
+        # This part of the code will be removed in a later step.
+        
+        # Now apply the formatting to the tables
+        self._apply_formatting()
+        
+        # Print the tables
         self._print_tables()
+        
+        # Check for alerts
         self._check_alerts()
+
+    def _format_cell(self, value_tuple):
+        """Formats a (current, past) tuple into the desired string format."""
+        if not isinstance(value_tuple, tuple) or len(value_tuple) != 2:
+            return "N/A"
+        
+        current, past = value_tuple
+        if past is None or past == 0:
+            return "N/A"
+        
+        absolute_change = current - past
+        percent_change = (absolute_change / past) * 100
+        
+        return f"{percent_change:.2f}% ({absolute_change})"
+
+    def _apply_formatting(self):
+        """Applies the cell formatting to all three tables."""
+        for col in ['3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr']:
+            if col in self.put_oi_data.columns:
+                self.put_oi_data[col] = self.put_oi_data[col].apply(self._format_cell)
+            if col in self.call_oi_data.columns:
+                self.call_oi_data[col] = self.call_oi_data[col].apply(self._format_cell)
+            if col in self.nifty_data.columns:
+                self.nifty_data[col] = self.nifty_data[col].apply(self._format_cell)
+        # The old printing logic is now removed.
 
     def _is_red(self, val, col_name):
         if isinstance(val, str) and '%' in val:
@@ -241,13 +292,13 @@ class OITrackerStrategy:
                 percent = float(val.split('%')[0])
                 time_val, time_unit = col_name.split(' ')
                 time_val = int(time_val)
-
-                thresholds = self.strat_var_color_thresholds
-
+                
+                thresholds = self.cfg.get("color_thresholds", {})
+                
                 if time_unit == 'Hr':
                     time_val = time_val * 60
-
-                if time_val in thresholds and percent > thresholds[time_val]:
+                
+                if str(time_val) in thresholds and percent > thresholds[str(time_val)]:
                     return True
 
             except (ValueError, IndexError):
@@ -255,31 +306,28 @@ class OITrackerStrategy:
         return False
 
     def _print_tables(self):
+        
+        def color_code_df(df):
+            df_colored = df.copy()
+            for col in ['3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr']:
+                if col in df_colored.columns:
+                    df_colored[col] = df_colored[col].apply(lambda x: colored(x, 'red') if self._is_red(x, col) else x)
+            return df_colored
 
-        def color_code(val, col_name):
-            if self._is_red(val, col_name):
-                return colored(val, 'red')
-            return val
-
+        # Clear console before printing
+        os.system('cls' if os.name == 'nt' else 'clear')
+        
         print("--- Put OI Data ---")
-        for index, row in self.put_oi_data.iterrows():
-            for col in self.put_oi_data.columns:
-                print(f"{color_code(row[col], col): <20}", end="")
-            print()
-
+        print(color_code_df(self.put_oi_data).to_string())
+        
         print("\n--- Call OI Data ---")
-        for index, row in self.call_oi_data.iterrows():
-            for col in self.call_oi_data.columns:
-                print(f"{color_code(row[col], col): <20}", end="")
-            print()
+        print(color_code_df(self.call_oi_data).to_string())
 
         print("\n--- NIFTY Data ---")
         print(self.nifty_data.to_string())
 
-
     def _check_alerts(self):
-        red_cell_count = 0
-
+        
         def count_red_cells(df):
             count = 0
             for col in df.columns:
@@ -289,68 +337,61 @@ class OITrackerStrategy:
                             count += 1
             return count
 
-        red_cell_count += count_red_cells(self.put_oi_data)
-        red_cell_count += count_red_cells(self.call_oi_data)
-        total_cells = (len(self.put_oi_data) * 6) + (len(self.call_oi_data) * 6)
+        put_red_cells = count_red_cells(self.put_oi_data)
+        call_red_cells = count_red_cells(self.call_oi_data)
+        
+        total_cells_per_table = (len(self.put_oi_data.index) * 6) # 6 time columns
 
-        if total_cells > 0 and (red_cell_count / total_cells) > 0.3:
+        if total_cells_per_table > 0 and ((put_red_cells / total_cells_per_table) > 0.3 or (call_red_cells / total_cells_per_table) > 0.3):
             try:
-                pygame.mixer.music.load("alert.wav") #OR alert.mp3
+                alert_sound = self.cfg.get("alert_sound", "alert.wav")
+                pygame.mixer.music.load(alert_sound)
                 pygame.mixer.music.play()
             except pygame.error:
-                logger.error("Could not play alert sound. Make sure 'alert.wav' or 'alert.mp3' is in the root directory.")
-            logger.warning("ALERT: More than 30% of cells are red!")
+                logger.error(f"Could not play alert sound. Make sure '{alert_sound}' is in the root directory.")
+            logger.warning("ALERT: More than 30% of cells in one of the tables are red!")
 
-if __name__ == "__main__":
-    import time
-    import yaml
-    import sys
-    import argparse
-    from dispatcher import DataDispatcher
-    from brokers.zerodha import ZerodhaBroker
-    from logger import logger
-    from queue import Queue
-    import traceback
-    import warnings
-    warnings.filterwarnings("ignore")
 
-    import logging
-    logger.setLevel(logging.INFO)
+def main():
+    # Load YAML config
+    with open(CONFIG_PATH, "r") as f:
+        cfg = yaml.safe_load(f)
 
-    config_file = os.path.join(os.path.dirname(__file__), "configs/oi_tracker.yml")
-    with open(config_file, 'r') as f:
-        config = yaml.safe_load(f)['default']
-
-    broker = ZerodhaBroker(without_totp=False)
-
+    broker = ZerodhaBroker()
     dispatcher = DataDispatcher()
     dispatcher.register_main_queue(Queue())
 
+    strategy = OITrackerStrategy(broker, cfg)
+
+    # --- Callbacks wired to this strategy instance ---
     def on_ticks(ws, ticks):
-        logger.debug("Received ticks: {}".format(ticks))
-        dispatcher.dispatch(ticks)
+        try:
+            dispatcher.dispatch(ticks)
+        except Exception as e:
+            logger.error(f"Dispatch error: {e}", exc_info=True)
 
     def on_connect(ws, response):
-        logger.info("Websocket connected successfully: {}".format(response))
-        ws.subscribe(instrument_tokens)
-        ws.set_mode(ws.MODE_FULL, instrument_tokens)
+        try:
+            logger.info(f"Websocket connected successfully: {response}")
+            ntok = _to_int(strategy._nifty_token)
+            logger.info(f"Subscribing to NIFTY 50 (token: {ntok})...")
+            ws.subscribe([ntok])
+            logger.info("NIFTY 50 subscription successful.")
+            ws.set_mode(ws.MODE_LTP, [ntok])
+            logger.info("NIFTY 50 mode set to LTP.")
+
+            option_tokens = [_to_int(t) for t in strategy._option_tokens]
+            if option_tokens:
+                logger.info(f"Subscribing to {len(option_tokens)} option instruments...")
+                ws.subscribe(option_tokens)
+                logger.info("Option instruments subscription successful.")
+                ws.set_mode(ws.MODE_FULL, option_tokens)
+                logger.info("Option instruments mode set to FULL.")
+        except Exception as e:
+            logger.error(f"on_connect failed: {e}", exc_info=True)
 
     broker.on_ticks = on_ticks
     broker.on_connect = on_connect
-
-    strategy = OITrackerStrategy(broker, config)
-
-    # Get all instrument tokens to subscribe
-    instrument_tokens = [strategy.instruments[strategy.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]['instrument_token']]
-    atm_strike = strategy._get_atm_strike(broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price'])
-    strike_prices = [atm_strike + i * strategy.strike_difference for i in range(-2, 3)]
-    for strike in strike_prices:
-        put_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'PE')]
-        call_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'CE')]
-        if not put_instrument.empty:
-            instrument_tokens.append(put_instrument.iloc[0]['instrument_token'])
-        if not call_instrument.empty:
-            instrument_tokens.append(call_instrument.iloc[0]['instrument_token'])
 
     broker.connect_websocket()
 
@@ -359,20 +400,16 @@ if __name__ == "__main__":
             try:
                 tick_data = dispatcher._main_queue.get()
                 strategy.on_ticks_update(tick_data)
-
             except KeyboardInterrupt:
-                logger.info("SHUTDOWN REQUESTED - Stopping strategy...")
+                logger.info("KeyboardInterrupt received. Stopping strategy.")
                 break
-
-            except Exception as tick_error:
-                logger.error(f"Error processing tick data: {tick_error}")
-                traceback.print_exc()
+            except Exception as e:
+                logger.error(f"Error processing tick data: {e}", exc_info=True)
                 continue
-
-    except Exception as fatal_error:
-        logger.error("FATAL ERROR in main trading loop:")
-        logger.error(f"Error: {fatal_error}")
-        traceback.print_exc()
-
+    except Exception:
+        logger.error("FATAL ERROR in main loop", exc_info=True)
     finally:
         logger.info("STRATEGY SHUTDOWN COMPLETE")
+
+if __name__ == "__main__":
+    main()

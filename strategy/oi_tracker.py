@@ -332,8 +332,11 @@ if __name__ == "__main__":
 
     def on_connect(ws, response):
         logger.info("Websocket connected successfully: {}".format(response))
-        ws.subscribe(instrument_tokens)
-        ws.set_mode(ws.MODE_FULL, instrument_tokens)
+        ws.subscribe([nifty_instrument_token])
+        ws.set_mode(ws.MODE_LTP, [nifty_instrument_token])
+        if option_instrument_tokens:
+            ws.subscribe(option_instrument_tokens)
+            ws.set_mode(ws.MODE_FULL, option_instrument_tokens)
 
     broker.on_ticks = on_ticks
     broker.on_connect = on_connect
@@ -341,16 +344,17 @@ if __name__ == "__main__":
     strategy = OITrackerStrategy(broker, config)
 
     # Get all instrument tokens to subscribe
-    instrument_tokens = [strategy.instruments[strategy.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]['instrument_token']]
+    nifty_instrument_token = strategy.instruments[strategy.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]['instrument_token']
+    option_instrument_tokens = []
     atm_strike = strategy._get_atm_strike(broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price'])
     strike_prices = [atm_strike + i * strategy.strike_difference for i in range(-2, 3)]
     for strike in strike_prices:
         put_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'PE')]
         call_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'CE')]
         if not put_instrument.empty:
-            instrument_tokens.append(put_instrument.iloc[0]['instrument_token'])
+            option_instrument_tokens.append(put_instrument.iloc[0]['instrument_token'])
         if not call_instrument.empty:
-            instrument_tokens.append(call_instrument.iloc[0]['instrument_token'])
+            option_instrument_tokens.append(call_instrument.iloc[0]['instrument_token'])
 
     broker.connect_websocket()
 

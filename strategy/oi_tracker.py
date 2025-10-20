@@ -289,17 +289,18 @@ class OITrackerStrategy:
                             count += 1
             return count
 
-        red_cell_count += count_red_cells(self.put_oi_data)
-        red_cell_count += count_red_cells(self.call_oi_data)
-        total_cells = (len(self.put_oi_data) * 6) + (len(self.call_oi_data) * 6)
+        put_red_cells = count_red_cells(self.put_oi_data)
+        call_red_cells = count_red_cells(self.call_oi_data)
 
-        if total_cells > 0 and (red_cell_count / total_cells) > 0.3:
+        total_cells_per_table = (len(self.put_oi_data.index) * (len(self.put_oi_data.columns) - 2))
+
+        if total_cells_per_table > 0 and ((put_red_cells / total_cells_per_table) > 0.3 or (call_red_cells / total_cells_per_table) > 0.3):
             try:
                 pygame.mixer.music.load("alert.wav") #OR alert.mp3
                 pygame.mixer.music.play()
             except pygame.error:
                 logger.error("Could not play alert sound. Make sure 'alert.wav' or 'alert.mp3' is in the root directory.")
-            logger.warning("ALERT: More than 30% of cells are red!")
+            logger.warning("ALERT: More than 30% of cells in one of the tables are red!")
 
 if __name__ == "__main__":
     import time
@@ -332,10 +333,10 @@ if __name__ == "__main__":
 
     def on_connect(ws, response):
         logger.info("Websocket connected successfully: {}".format(response))
-        ws.subscribe([nifty_instrument_token])
+        ws.subscribe(instrument_tokens)
         ws.set_mode(ws.MODE_LTP, [nifty_instrument_token])
+        option_instrument_tokens = [token for token in instrument_tokens if token != nifty_instrument_token]
         if option_instrument_tokens:
-            ws.subscribe(option_instrument_tokens)
             ws.set_mode(ws.MODE_FULL, option_instrument_tokens)
 
     broker.on_ticks = on_ticks
@@ -345,16 +346,16 @@ if __name__ == "__main__":
 
     # Get all instrument tokens to subscribe
     nifty_instrument_token = strategy.instruments[strategy.instruments['tradingsymbol'] == 'NIFTY 50'].iloc[0]['instrument_token']
-    option_instrument_tokens = []
+    instrument_tokens = [nifty_instrument_token]
     atm_strike = strategy._get_atm_strike(broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price'])
     strike_prices = [atm_strike + i * strategy.strike_difference for i in range(-2, 3)]
     for strike in strike_prices:
         put_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'PE')]
         call_instrument = strategy.instruments[(strategy.instruments['strike'] == strike) & (strategy.instruments['instrument_type'] == 'CE')]
         if not put_instrument.empty:
-            option_instrument_tokens.append(put_instrument.iloc[0]['instrument_token'])
+            instrument_tokens.append(put_instrument.iloc[0]['instrument_token'])
         if not call_instrument.empty:
-            option_instrument_tokens.append(call_instrument.iloc[0]['instrument_token'])
+            instrument_tokens.append(call_instrument.iloc[0]['instrument_token'])
 
     broker.connect_websocket()
 

@@ -333,11 +333,20 @@ if __name__ == "__main__":
 
     def on_connect(ws, response):
         logger.info("Websocket connected successfully: {}".format(response))
+
+        logger.info("Subscribing to all instruments...")
         ws.subscribe(instrument_tokens)
+        logger.info("Subscription successful.")
+
+        logger.info(f"Setting mode to LTP for NIFTY 50 (token: {nifty_instrument_token})...")
         ws.set_mode(ws.MODE_LTP, [nifty_instrument_token])
+        logger.info("NIFTY 50 mode set to LTP.")
+
         option_instrument_tokens = [token for token in instrument_tokens if token != nifty_instrument_token]
         if option_instrument_tokens:
+            logger.info(f"Setting mode to FULL for {len(option_instrument_tokens)} option instruments...")
             ws.set_mode(ws.MODE_FULL, option_instrument_tokens)
+            logger.info("Option instruments mode set to FULL.")
 
     broker.on_ticks = on_ticks
     broker.on_connect = on_connect

@@ -27,69 +27,37 @@ class ZerodhaBroker(BrokerBase):
         self.kite_ws = KiteTicker(api_key=os.getenv('BROKER_API_KEY'), access_token=self.auth_response_data["access_token"])
         self.tick_counter = 0
         self.symbols = []
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 10
         
     def authenticate(self):
         api_key = os.getenv('BROKER_API_KEY')
         api_secret = os.getenv('BROKER_API_SECRET')
-        broker_id = os.getenv('BROKER_ID')
-        totp_secret = os.getenv('BROKER_TOTP_KEY')
-        password = os.getenv('BROKER_PASSWORD')
 
-        if self.without_totp:
-            kite = KiteConnect(api_key=os.getenv('BROKER_API_KEY'))
-            print(f"Please Login to Zerodha and get the request token from the URL.\n {kite.login_url()} \nThen paste the request token here:")
-            request_token = input("Request Token: ")
-            resp = kite.generate_session(request_token, os.environ['BROKER_API_SECRET'])
-            return kite, resp
-        
+        if not all([api_key, api_secret]):
+            raise Exception("BROKER_API_KEY and BROKER_API_SECRET must be set in the .env file.")
 
-        if not all([api_key, api_secret, broker_id, totp_secret]):
-            raise Exception("Missing one or more required environment variables.")
+        kite = KiteConnect(api_key=api_key)
 
-        session = requests.Session()
+        print("="*80)
+        print("Please follow these steps to authenticate:")
+        print("1. Open the following URL in your web browser:")
+        print(f"   {kite.login_url()}")
+        print("2. Log in to your Zerodha account.")
+        print("3. You will be redirected to a new URL. Copy the 'request_token' from that URL.")
+        print("   (It looks like: ...&request_token=YOUR_TOKEN&action=...)")
+        print("4. Paste the request_token below and press Enter.")
+        print("="*80)
 
-        # Step 1: Login 
-        login_url = "https://kite.zerodha.com/api/login"
-        login_payload = {
-            "user_id": broker_id,
-            "password": password,
-        }
-        login_resp = session.post(login_url, data=login_payload)
-        login_data = login_resp.json()
-        if not login_data.get("data"):
-            raise Exception(f"Login failed: {login_data}")
-        request_id = login_data["data"]["request_id"]
+        request_token = input("Enter the request_token: ")
 
-        # Step 2: TwoFA
-        twofa_url = "https://kite.zerodha.com/api/twofa"
         try:
-            totp = pyotp.TOTP(totp_secret).now()
+            resp = kite.generate_session(request_token, api_secret)
         except Exception as e:
-            logger.error(f"Error generating TOTP: {e}")
-            logger.error("Please ensure that the BROKER_TOTP_KEY in your .env file is a valid Base32 encoded string.")
+            logger.error(f"Authentication failed: {e}")
             sys.exit(1)
-
-        twofa_payload = {
-            "user_id": broker_id,
-            "request_id": request_id,
-            "twofa_value": totp,
-            # "twofa_type": "totp",
-        }
-        twofa_resp = session.post(twofa_url, data=twofa_payload)
-        twofa_data = twofa_resp.json()
-        if not twofa_data.get("data"):
-            raise Exception(f"2FA failed: {twofa_data}")
-
-        kite = KiteConnect(api_key=os.getenv('BROKER_API_KEY'))
-        # Step 3: Get request_token from redirect
-        connect_url = f"https://kite.trade/connect/login?api_key={api_key}"
-        connect_resp = session.get(connect_url, allow_redirects=True)
-        if "request_token=" not in connect_resp.url:
-            raise Exception("Failed to get request_token from redirect URL.")
-        request_token = connect_resp.url.split("request_token=")[1].split("&")[0]
-
-        resp = kite.generate_session(request_token, os.environ['BROKER_API_SECRET'])
         
+        logger.info("Authentication successful!")
         return kite, resp
     
     def get_orders(self):
@@ -197,6 +165,7 @@ class ZerodhaBroker(BrokerBase):
         # Callback on successful connect.
         # Subscribe to a list of instrument_tokens (RELIANCE and ACC here).
         logger.info("Connected")
+        self.reconnect_attempts = 0 # Reset reconnect attempts on successful connection
         # Set RELIANCE to tick in `full` mode.
         ws.subscribe(self.symbols)
         ws.set_mode(ws.MODE_FULL, self.symbols)
@@ -237,6 +206,10 @@ class ZerodhaBroker(BrokerBase):
         The actual implementation has to be handled by the user
         """
         logger.info("Reconnecting: {}".format(attempts_count))
+        self.reconnect_attempts = attempts_count
+        if self.reconnect_attempts > self.max_reconnect_attempts:
+            logger.error("Too many reconnect attempts. Exiting.")
+            sys.exit(1)
 
 
     # Callback when all reconnect failed (exhausted max retries)
@@ -246,7 +219,8 @@ class ZerodhaBroker(BrokerBase):
         This is the skeleton of the callback.
         The actual implementation has to be handled by the user
         """
-        logger.info("Reconnect failed.")
+        logger.error("Reconnect failed after multiple attempts. The market might be closed or there could be a network issue.")
+        sys.exit(1)
     
     def download_instruments(self):
         instruments = self.kite.instruments()

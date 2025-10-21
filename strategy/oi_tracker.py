@@ -61,7 +61,7 @@ class OITrackerStrategy:
             pygame.mixer.init()
         except Exception:
             pass
-        
+
         # Initialize the three tables
         self.put_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
         self.call_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
@@ -212,7 +212,7 @@ class OITrackerStrategy:
         current_price = self.broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price']
         atm_strike = self._get_atm_strike(current_price)
         strikes = [atm_strike + i * self.strike_difference for i in range(-2, 3)]
-        
+
         # Clear the tables before populating
         self.put_oi_data = self.put_oi_data.iloc[0:0]
         self.call_oi_data = self.call_oi_data.iloc[0:0]
@@ -247,17 +247,17 @@ class OITrackerStrategy:
             past_price = _oi_at_or_before(self._nifty_token, now - delta_t) # Reusing oi history func for price
             nifty_row[label] = (current_price, past_price)
         self.nifty_data.loc[0] = nifty_row
-        
+
         # NOTE: The rest of the original function that prints tables is now obsolete
         # and will be replaced by the _print_tables and _check_alerts methods.
         # This part of the code will be removed in a later step.
-        
+
         # Now apply the formatting to the tables
         self._apply_formatting()
-        
+
         # Print the tables
         self._print_tables()
-        
+
         # Check for alerts
         self._check_alerts()
 
@@ -265,14 +265,14 @@ class OITrackerStrategy:
         """Formats a (current, past) tuple into the desired string format."""
         if not isinstance(value_tuple, tuple) or len(value_tuple) != 2:
             return "N/A"
-        
+
         current, past = value_tuple
         if past is None or past == 0:
             return "N/A"
-        
+
         absolute_change = current - past
         percent_change = (absolute_change / past) * 100
-        
+
         return f"{percent_change:.2f}% ({absolute_change})"
 
     def _apply_formatting(self):
@@ -292,12 +292,12 @@ class OITrackerStrategy:
                 percent = float(val.split('%')[0])
                 time_val, time_unit = col_name.split(' ')
                 time_val = int(time_val)
-                
+
                 thresholds = self.cfg.get("color_thresholds", {})
-                
+
                 if time_unit == 'Hr':
                     time_val = time_val * 60
-                
+
                 if str(time_val) in thresholds and percent > thresholds[str(time_val)]:
                     return True
 
@@ -306,7 +306,7 @@ class OITrackerStrategy:
         return False
 
     def _print_tables(self):
-        
+
         def color_code_df(df):
             df_colored = df.copy()
             for col in ['3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr']:
@@ -316,10 +316,10 @@ class OITrackerStrategy:
 
         # Clear console before printing
         os.system('cls' if os.name == 'nt' else 'clear')
-        
+
         print("--- Put OI Data ---")
         print(color_code_df(self.put_oi_data).to_string())
-        
+
         print("\n--- Call OI Data ---")
         print(color_code_df(self.call_oi_data).to_string())
 
@@ -327,7 +327,7 @@ class OITrackerStrategy:
         print(self.nifty_data.to_string())
 
     def _check_alerts(self):
-        
+
         def count_red_cells(df):
             count = 0
             for col in df.columns:
@@ -339,7 +339,7 @@ class OITrackerStrategy:
 
         put_red_cells = count_red_cells(self.put_oi_data)
         call_red_cells = count_red_cells(self.call_oi_data)
-        
+
         total_cells_per_table = (len(self.put_oi_data.index) * 6) # 6 time columns
 
         if total_cells_per_table > 0 and ((put_red_cells / total_cells_per_table) > 0.3 or (call_red_cells / total_cells_per_table) > 0.3):

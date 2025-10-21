@@ -38,13 +38,7 @@ class OITrackerStrategy:
         self.lot_size = int(cfg.get("lot_size", 50))
         self.refresh_interval = int(cfg.get("refresh_interval", 1))
 
-        instruments_csv = cfg.get("instruments_csv", os.path.join(PROJECT_ROOT, "instruments.csv"))
-        if not os.path.exists(instruments_csv):
-            raise FileNotFoundError(
-                f"Missing instruments file: {instruments_csv}. "
-                f"Set 'instruments_csv' in {CONFIG_PATH}"
-            )
-        self.instruments = pd.read_csv(instruments_csv)
+        self.instruments = self.broker.download_instruments(exchange=self.exchange, segment="NFO-OPT")
 
         logger.info(f"Strike difference for is {self.strike_difference}")
 
@@ -74,10 +68,32 @@ class OITrackerStrategy:
         now = datetime.now()
         from_date = now - timedelta(hours=3)
 
+        # Ensure 'expiry' is a datetime object for comparison, correctly parsing DD-MM-YYYY
+        self.instruments['expiry'] = pd.to_datetime(self.instruments['expiry'], errors='coerce', dayfirst=True).dt.date
+
+        # Find the closest expiry date for NIFTY options
+        nifty_options = self.instruments[
+            (self.instruments['name'] == self.symbol) &
+            (self.instruments['segment'] == self.exchange)
+        ].copy()
+
+        future_expiries = nifty_options[nifty_options['expiry'] >= now.date()]
+        if future_expiries.empty:
+            logger.error("Failed to find any future NIFTY options. Here's a sample of the latest expiring options found:")
+            logger.error(nifty_options.sort_values(by='expiry', ascending=False).head())
+            raise RuntimeError("No future NIFTY options found.")
+        closest_expiry = future_expiries['expiry'].min()
+
+        self.instruments = self.instruments[self.instruments['expiry'] == closest_expiry]
+        logger.info(f"Filtered to {len(self.instruments)} instruments for expiry {closest_expiry}")
+        logger.info("Sample of filtered instruments:")
+        logger.info(self.instruments.head())
+
+
         # --- NIFTY 50 token ---
-        nifty_df = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50']
+        nifty_df = self.broker.instruments_df[self.broker.instruments_df['tradingsymbol'] == 'NIFTY 50']
         if nifty_df.empty:
-            raise RuntimeError("NIFTY 50 instrument not found in instruments.csv")
+            raise RuntimeError("NIFTY 50 instrument not found.")
         self._nifty_token = _to_int(nifty_df.iloc[0]['instrument_token'])
 
         # --- ATM ±2 strikes ---
@@ -351,6 +367,11 @@ class OITrackerStrategy:
                 logger.error(f"Could not play alert sound. Make sure '{alert_sound}' is in the root directory.")
             logger.warning("ALERT: More than 30% of cells in one of the tables are red!")
 
+
+def main():
+    # Load YAML config
+    with open(CONFIG_PATH, "r") as f:
+        cfg = yaml.safe_load(f)
 
 def main():
     # Load YAML config

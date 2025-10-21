@@ -73,6 +73,20 @@ class ZerodhaBroker:
     def orders(self):
         return self.kite.orders()
 
+    def download_instruments(self, exchange=None, segment=None):
+        """Downloads all tradable instruments from Kite, with optional filtering."""
+        import pandas as pd
+        logger.info(f"Downloading instruments for exchange='{exchange}' and segment='{segment}'...")
+        instruments = self.kite.instruments(exchange=exchange)
+        df = pd.DataFrame(instruments)
+
+        if segment:
+            df = df[df['segment'] == segment]
+
+        self.instruments_df = df
+        logger.info(f"Downloaded and filtered {len(self.instruments_df)} instruments.")
+        return self.instruments_df
+
     # ---------- WebSocket ----------
     def connect_websocket(self, max_tries: int = 10, delay: int = 5):
         """Connects ticker in a way that works across old/new kiteconnect versions."""

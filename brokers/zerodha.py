@@ -87,7 +87,7 @@ class ZerodhaBroker:
         logger.info("Downloading all instruments from broker...")
         instruments = self.kite.instruments()
         df = pd.DataFrame(instruments)
-
+        
         self.instruments_df = df
         logger.info(f"Downloaded and cached {len(self.instruments_df)} instruments.")
         return self.instruments_df

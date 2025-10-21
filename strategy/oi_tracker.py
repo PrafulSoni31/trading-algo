@@ -1,6 +1,7 @@
+#oi_tracker.py
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from collections import deque, defaultdict
 
@@ -50,6 +51,7 @@ class OITrackerStrategy:
 
         # live OI store per token and rolling buffer of (timestamp, oi)
         self._live_oi = {}                      # token -> latest OI
+        self._live_nifty_price = 24000.0        # Default NIFTY price until first tick
         self._oi_buffers = defaultdict(deque)   # token -> deque[(ts, oi)]
         self._buf_maxlen = 2000                 # ~enough for a few hours at 1s-5s ticks
 
@@ -61,7 +63,7 @@ class OITrackerStrategy:
             pygame.mixer.init()
         except Exception:
             pass
-        
+
         # Initialize the three tables
         self.put_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
         self.call_oi_data = pd.DataFrame(columns=['Strike', 'Current OI', '3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr'])
@@ -150,40 +152,51 @@ class OITrackerStrategy:
         Consume incoming FULL/LTP ticks, update live OI, extend minute history, and
         print OI deltas for CE/PE grouped by strike over time windows.
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # 1) ingest ticks
-        updated_tokens = set()
+        updated_oi_tokens = set()
         for tk in ticks:
             token = int(tk.get("instrument_token"))
-            oi = tk.get("oi")
-            if oi is None:
-                # index LTP tick will not have OI; skip
-                continue
-            self._live_oi[token] = int(oi)
-            buf = self._oi_buffers[token]
-            buf.append((now, int(oi)))
-            if len(buf) > self._buf_maxlen:
-                buf.popleft()
-            updated_tokens.add(token)
-
-        if not updated_tokens:
-            return  # nothing to aggregate
+            if token == self._nifty_token:
+                # It's an LTP tick for NIFTY
+                price = tk.get("last_price")
+                if price is not None:
+                    self._live_nifty_price = float(price)
+            else:
+                # It's a FULL tick for an option
+                oi = tk.get("oi")
+                if oi is None:
+                    continue
+                self._live_oi[token] = int(oi)
+                buf = self._oi_buffers[token]
+                buf.append((now, int(oi)))
+                if len(buf) > self._buf_maxlen:
+                    buf.popleft()
+                updated_oi_tokens.add(token)
 
         # 2) ensure minute history tracks along
-        for token in updated_tokens:
+        for token in updated_oi_tokens:
             df = self.historical_data_dfs.get(token)
             if df is None or df.empty:
                 self.historical_data_dfs[token] = pd.DataFrame({"oi": [self._live_oi[token]]}, index=[now])
             else:
                 last_idx = df.index[-1] if len(df.index) else None
                 if last_idx is None or (now - last_idx).total_seconds() >= 55:
-                    # If 'oi' column isn't there yet, create it
                     if "oi" not in df.columns:
-                        df["oi"] = None
+                        df["oi"] = None # Add oi column if not present
                     df.loc[now, "oi"] = self._live_oi[token]
                     cutoff = now - timedelta(hours=4)
                     self.historical_data_dfs[token] = df[df.index >= cutoff]
+
+        # also update nifty history
+        nifty_df = self.historical_data_dfs.get(self._nifty_token)
+        if nifty_df is not None:
+            last_idx = nifty_df.index[-1] if len(nifty_df.index) else None
+            if last_idx is None or (now - last_idx).total_seconds() >= 55:
+                nifty_df.loc[now, "close"] = self._live_nifty_price
+                cutoff = now - timedelta(hours=4)
+                self.historical_data_dfs[self._nifty_token] = nifty_df[nifty_df.index >= cutoff]
 
         # 3) compute deltas for windows using history where possible
         windows = {
@@ -209,14 +222,26 @@ class OITrackerStrategy:
                 return None
             return int(v.iloc[-1])
 
-        current_price = self.broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price']
+        def _price_at_or_before(token: int, ts: datetime) -> float | None:
+            df = self.historical_data_dfs.get(token)
+            if df is None or df.empty or "close" not in df.columns:
+                return None
+            sub = df.loc[:ts]
+            if sub.empty or "close" not in sub:
+                return None
+            v = sub["close"].dropna()
+            if v.empty:
+                return None
+            return float(v.iloc[-1])
+
+        current_price = self._live_nifty_price
         atm_strike = self._get_atm_strike(current_price)
         strikes = [atm_strike + i * self.strike_difference for i in range(-2, 3)]
-        
+
         # Clear the tables before populating
-        self.put_oi_data = self.put_oi_data.iloc[0:0]
-        self.call_oi_data = self.call_oi_data.iloc[0:0]
-        self.nifty_data = self.nifty_data.iloc[0:0]
+        self.put_oi_data = pd.DataFrame(columns=self.put_oi_data.columns)
+        self.call_oi_data = pd.DataFrame(columns=self.call_oi_data.columns)
+        self.nifty_data = pd.DataFrame(columns=self.nifty_data.columns)
 
         for strike in strikes:
             # Find the put and call tokens for the current strike
@@ -244,20 +269,20 @@ class OITrackerStrategy:
         # --- Populate NIFTY Table ---
         nifty_row = {"Current NIFTY": current_price}
         for label, delta_t in windows.items():
-            past_price = _oi_at_or_before(self._nifty_token, now - delta_t) # Reusing oi history func for price
+            past_price = _price_at_or_before(self._nifty_token, now - delta_t)
             nifty_row[label] = (current_price, past_price)
         self.nifty_data.loc[0] = nifty_row
-        
+
         # NOTE: The rest of the original function that prints tables is now obsolete
         # and will be replaced by the _print_tables and _check_alerts methods.
         # This part of the code will be removed in a later step.
-        
+
         # Now apply the formatting to the tables
         self._apply_formatting()
-        
+
         # Print the tables
         self._print_tables()
-        
+
         # Check for alerts
         self._check_alerts()
 
@@ -265,14 +290,14 @@ class OITrackerStrategy:
         """Formats a (current, past) tuple into the desired string format."""
         if not isinstance(value_tuple, tuple) or len(value_tuple) != 2:
             return "N/A"
-        
+
         current, past = value_tuple
         if past is None or past == 0:
             return "N/A"
-        
+
         absolute_change = current - past
         percent_change = (absolute_change / past) * 100
-        
+
         return f"{percent_change:.2f}% ({absolute_change})"
 
     def _apply_formatting(self):
@@ -292,12 +317,12 @@ class OITrackerStrategy:
                 percent = float(val.split('%')[0])
                 time_val, time_unit = col_name.split(' ')
                 time_val = int(time_val)
-                
+
                 thresholds = self.cfg.get("color_thresholds", {})
-                
+
                 if time_unit == 'Hr':
                     time_val = time_val * 60
-                
+
                 if str(time_val) in thresholds and percent > thresholds[str(time_val)]:
                     return True
 
@@ -306,7 +331,7 @@ class OITrackerStrategy:
         return False
 
     def _print_tables(self):
-        
+
         def color_code_df(df):
             df_colored = df.copy()
             for col in ['3 Min', '5 Min', '10 Min', '15 Min', '30 Min', '3 Hr']:
@@ -316,10 +341,10 @@ class OITrackerStrategy:
 
         # Clear console before printing
         os.system('cls' if os.name == 'nt' else 'clear')
-        
+
         print("--- Put OI Data ---")
         print(color_code_df(self.put_oi_data).to_string())
-        
+
         print("\n--- Call OI Data ---")
         print(color_code_df(self.call_oi_data).to_string())
 
@@ -327,7 +352,7 @@ class OITrackerStrategy:
         print(self.nifty_data.to_string())
 
     def _check_alerts(self):
-        
+
         def count_red_cells(df):
             count = 0
             for col in df.columns:
@@ -339,7 +364,7 @@ class OITrackerStrategy:
 
         put_red_cells = count_red_cells(self.put_oi_data)
         call_red_cells = count_red_cells(self.call_oi_data)
-        
+
         total_cells_per_table = (len(self.put_oi_data.index) * 6) # 6 time columns
 
         if total_cells_per_table > 0 and ((put_red_cells / total_cells_per_table) > 0.3 or (call_red_cells / total_cells_per_table) > 0.3):

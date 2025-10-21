@@ -84,8 +84,3 @@ def run_auto_login():
 
 if __name__ == "__main__":
     run_auto_login()
-
-# How to use:
-# 1) Put credentials in .env (BROKER_USER_ID, BROKER_PASSWORD, BROKER_TOTP_SECRET, BROKER_API_KEY, BROKER_API_SECRET)
-# 2) Run: python auto_login.py
-# 3) It writes kite_token.json in the current working directory.

@@ -1,6 +1,7 @@
+#oi_tracker.py
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from queue import Queue
 from collections import deque, defaultdict
 
@@ -38,11 +39,13 @@ class OITrackerStrategy:
         self.lot_size = int(cfg.get("lot_size", 50))
         self.refresh_interval = int(cfg.get("refresh_interval", 1))
 
-        self.all_instruments = self.broker.download_instruments() # Get all instruments
-        self.instruments = self.all_instruments[
-            (self.all_instruments['exchange'] == self.exchange) &
-            (self.all_instruments['segment'] == "NFO-OPT")
-        ].copy()
+        instruments_csv = cfg.get("instruments_csv", os.path.join(PROJECT_ROOT, "instruments.csv"))
+        if not os.path.exists(instruments_csv):
+            raise FileNotFoundError(
+                f"Missing instruments file: {instruments_csv}. "
+                f"Set 'instruments_csv' in {CONFIG_PATH}"
+            )
+        self.instruments = pd.read_csv(instruments_csv)
 
         logger.info(f"Strike difference for is {self.strike_difference}")
 
@@ -73,32 +76,10 @@ class OITrackerStrategy:
         now = datetime.now()
         from_date = now - timedelta(hours=3)
 
-        # Ensure 'expiry' is a datetime object for comparison
-        self.instruments['expiry'] = pd.to_datetime(self.instruments['expiry'], errors='coerce').dt.date
-
-        # Find the closest expiry date for NIFTY options
-        nifty_options = self.instruments[
-            (self.instruments['name'] == self.symbol) &
-            (self.instruments['segment'] == self.exchange)
-        ].copy()
-
-        future_expiries = nifty_options[nifty_options['expiry'] >= now.date()]
-        if future_expiries.empty:
-            logger.error("Failed to find any future NIFTY options. Here's a sample of the latest expiring options found:")
-            logger.error(nifty_options.sort_values(by='expiry', ascending=False).head())
-            raise RuntimeError("No future NIFTY options found.")
-        closest_expiry = future_expiries['expiry'].min()
-
-        self.instruments = self.instruments[self.instruments['expiry'] == closest_expiry]
-        logger.info(f"Filtered to {len(self.instruments)} instruments for expiry {closest_expiry}")
-        logger.info("Sample of filtered instruments:")
-        logger.info(self.instruments.head())
-
-
         # --- NIFTY 50 token ---
-        nifty_df = self.broker.instruments_df[self.broker.instruments_df['tradingsymbol'] == 'NIFTY 50']
+        nifty_df = self.instruments[self.instruments['tradingsymbol'] == 'NIFTY 50']
         if nifty_df.empty:
-            raise RuntimeError("NIFTY 50 instrument not found.")
+            raise RuntimeError("NIFTY 50 instrument not found in instruments.csv")
         self._nifty_token = _to_int(nifty_df.iloc[0]['instrument_token'])
 
         # --- ATM ±2 strikes ---
@@ -171,7 +152,7 @@ class OITrackerStrategy:
         Consume incoming FULL/LTP ticks, update live OI, extend minute history, and
         print OI deltas for CE/PE grouped by strike over time windows.
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # 1) ingest ticks
         updated_oi_tokens = set()

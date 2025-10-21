@@ -59,6 +59,7 @@ class ZerodhaBroker:
         logger.info("Zerodha access token loaded and set.")
 
         self.kite_ws: KiteTicker | None = None
+        self.instruments_df = None
 
     # ---------- REST helpers ----------
     def get_quote(self, tradingsymbol: str) -> dict:
@@ -73,18 +74,22 @@ class ZerodhaBroker:
     def orders(self):
         return self.kite.orders()
 
-    def download_instruments(self, exchange=None, segment=None):
-        """Downloads all tradable instruments from Kite, with optional filtering."""
+    def download_instruments(self):
+        """
+        Downloads all tradable instruments from Kite and caches them in memory.
+        Subsequent calls will return the cached DataFrame.
+        """
+        if self.instruments_df is not None:
+            logger.info("Instruments already loaded. Returning cached dataframe.")
+            return self.instruments_df
+
         import pandas as pd
-        logger.info(f"Downloading instruments for exchange='{exchange}' and segment='{segment}'...")
-        instruments = self.kite.instruments(exchange=exchange)
+        logger.info("Downloading all instruments from broker...")
+        instruments = self.kite.instruments()
         df = pd.DataFrame(instruments)
 
-        if segment:
-            df = df[df['segment'] == segment]
-
         self.instruments_df = df
-        logger.info(f"Downloaded and filtered {len(self.instruments_df)} instruments.")
+        logger.info(f"Downloaded and cached {len(self.instruments_df)} instruments.")
         return self.instruments_df
 
     # ---------- WebSocket ----------

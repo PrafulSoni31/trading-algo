@@ -38,12 +38,17 @@ class OITrackerStrategy:
         self.lot_size = int(cfg.get("lot_size", 50))
         self.refresh_interval = int(cfg.get("refresh_interval", 1))
 
-        self.instruments = self.broker.download_instruments(exchange=self.exchange, segment="NFO-OPT")
+        self.all_instruments = self.broker.download_instruments() # Get all instruments
+        self.instruments = self.all_instruments[
+            (self.all_instruments['exchange'] == self.exchange) &
+            (self.all_instruments['segment'] == "NFO-OPT")
+        ].copy()
 
         logger.info(f"Strike difference for is {self.strike_difference}")
 
         # live OI store per token and rolling buffer of (timestamp, oi)
         self._live_oi = {}                      # token -> latest OI
+        self._live_nifty_price = 24000.0        # Default NIFTY price until first tick
         self._oi_buffers = defaultdict(deque)   # token -> deque[(ts, oi)]
         self._buf_maxlen = 2000                 # ~enough for a few hours at 1s-5s ticks
 
@@ -68,8 +73,8 @@ class OITrackerStrategy:
         now = datetime.now()
         from_date = now - timedelta(hours=3)
 
-        # Ensure 'expiry' is a datetime object for comparison, correctly parsing DD-MM-YYYY
-        self.instruments['expiry'] = pd.to_datetime(self.instruments['expiry'], errors='coerce', dayfirst=True).dt.date
+        # Ensure 'expiry' is a datetime object for comparison
+        self.instruments['expiry'] = pd.to_datetime(self.instruments['expiry'], errors='coerce').dt.date
 
         # Find the closest expiry date for NIFTY options
         nifty_options = self.instruments[
@@ -169,37 +174,48 @@ class OITrackerStrategy:
         now = datetime.now()
 
         # 1) ingest ticks
-        updated_tokens = set()
+        updated_oi_tokens = set()
         for tk in ticks:
             token = int(tk.get("instrument_token"))
-            oi = tk.get("oi")
-            if oi is None:
-                # index LTP tick will not have OI; skip
-                continue
-            self._live_oi[token] = int(oi)
-            buf = self._oi_buffers[token]
-            buf.append((now, int(oi)))
-            if len(buf) > self._buf_maxlen:
-                buf.popleft()
-            updated_tokens.add(token)
-
-        if not updated_tokens:
-            return  # nothing to aggregate
+            if token == self._nifty_token:
+                # It's an LTP tick for NIFTY
+                price = tk.get("last_price")
+                if price is not None:
+                    self._live_nifty_price = float(price)
+            else:
+                # It's a FULL tick for an option
+                oi = tk.get("oi")
+                if oi is None:
+                    continue
+                self._live_oi[token] = int(oi)
+                buf = self._oi_buffers[token]
+                buf.append((now, int(oi)))
+                if len(buf) > self._buf_maxlen:
+                    buf.popleft()
+                updated_oi_tokens.add(token)
 
         # 2) ensure minute history tracks along
-        for token in updated_tokens:
+        for token in updated_oi_tokens:
             df = self.historical_data_dfs.get(token)
             if df is None or df.empty:
                 self.historical_data_dfs[token] = pd.DataFrame({"oi": [self._live_oi[token]]}, index=[now])
             else:
                 last_idx = df.index[-1] if len(df.index) else None
                 if last_idx is None or (now - last_idx).total_seconds() >= 55:
-                    # If 'oi' column isn't there yet, create it
                     if "oi" not in df.columns:
-                        df["oi"] = None
+                        df["oi"] = None # Add oi column if not present
                     df.loc[now, "oi"] = self._live_oi[token]
                     cutoff = now - timedelta(hours=4)
                     self.historical_data_dfs[token] = df[df.index >= cutoff]
+
+        # also update nifty history
+        nifty_df = self.historical_data_dfs.get(self._nifty_token)
+        if nifty_df is not None:
+            last_idx = nifty_df.index[-1] if len(nifty_df.index) else None
+            if last_idx is None or (now - last_idx).total_seconds() >= 55:
+                nifty_df.loc[now, "close"] = self._live_nifty_price
+                cutoff = now - timedelta(hours=4)
+                self.historical_data_dfs[self._nifty_token] = nifty_df[nifty_df.index >= cutoff]
 
         # 3) compute deltas for windows using history where possible
         windows = {
@@ -225,14 +241,26 @@ class OITrackerStrategy:
                 return None
             return int(v.iloc[-1])
 
-        current_price = self.broker.get_quote("NSE:NIFTY 50")['NSE:NIFTY 50']['last_price']
+        def _price_at_or_before(token: int, ts: datetime) -> float | None:
+            df = self.historical_data_dfs.get(token)
+            if df is None or df.empty or "close" not in df.columns:
+                return None
+            sub = df.loc[:ts]
+            if sub.empty or "close" not in sub:
+                return None
+            v = sub["close"].dropna()
+            if v.empty:
+                return None
+            return float(v.iloc[-1])
+
+        current_price = self._live_nifty_price
         atm_strike = self._get_atm_strike(current_price)
         strikes = [atm_strike + i * self.strike_difference for i in range(-2, 3)]
 
         # Clear the tables before populating
-        self.put_oi_data = self.put_oi_data.iloc[0:0]
-        self.call_oi_data = self.call_oi_data.iloc[0:0]
-        self.nifty_data = self.nifty_data.iloc[0:0]
+        self.put_oi_data = pd.DataFrame(columns=self.put_oi_data.columns)
+        self.call_oi_data = pd.DataFrame(columns=self.call_oi_data.columns)
+        self.nifty_data = pd.DataFrame(columns=self.nifty_data.columns)
 
         for strike in strikes:
             # Find the put and call tokens for the current strike
@@ -260,7 +288,7 @@ class OITrackerStrategy:
         # --- Populate NIFTY Table ---
         nifty_row = {"Current NIFTY": current_price}
         for label, delta_t in windows.items():
-            past_price = _oi_at_or_before(self._nifty_token, now - delta_t) # Reusing oi history func for price
+            past_price = _price_at_or_before(self._nifty_token, now - delta_t)
             nifty_row[label] = (current_price, past_price)
         self.nifty_data.loc[0] = nifty_row
 
@@ -367,11 +395,6 @@ class OITrackerStrategy:
                 logger.error(f"Could not play alert sound. Make sure '{alert_sound}' is in the root directory.")
             logger.warning("ALERT: More than 30% of cells in one of the tables are red!")
 
-
-def main():
-    # Load YAML config
-    with open(CONFIG_PATH, "r") as f:
-        cfg = yaml.safe_load(f)
 
 def main():
     # Load YAML config

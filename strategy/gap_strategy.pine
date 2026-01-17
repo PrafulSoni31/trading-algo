@@ -65,17 +65,17 @@ effectiveOpen = timeframe.isdaily ? open : todayOpen
 isGapUp = gapType == "Full Gap (Open vs High/Low)" ? effectiveOpen > dHighPrev : effectiveOpen > dClosePrev
 isGapDown = gapType == "Full Gap (Open vs High/Low)" ? effectiveOpen < dLowPrev : effectiveOpen < dClosePrev
 
-longCondition = isEntryTime and
-                dRsiOnEmaPrev < rsiOS and
-                isGapUp and
-                (not buyBelowEMA or effectiveOpen < dEmaPrev) and
-                (not useMonthlyFilters or mTrendBull)
+longCondition = isEntryTime
+     and dRsiOnEmaPrev < rsiOS
+     and isGapUp
+     and (not buyBelowEMA or effectiveOpen < dEmaPrev)
+     and (not useMonthlyFilters or mTrendBull)
 
-shortCondition = isEntryTime and
-                 dRsiOnEmaPrev > rsiOB and
-                 isGapDown and
-                 (not sellAboveEMA or effectiveOpen > dEmaPrev) and
-                 (not useMonthlyFilters or mTrendBear)
+shortCondition = isEntryTime
+     and dRsiOnEmaPrev > rsiOB
+     and isGapDown
+     and (not sellAboveEMA or effectiveOpen > dEmaPrev)
+     and (not useMonthlyFilters or mTrendBear)
 
 // --- Strategy Execution ---
 var float longStopPrice = na

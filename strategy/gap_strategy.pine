@@ -80,6 +80,13 @@ var float longStopPrice = na
 var float shortStopPrice = na
 var float entryPrice = na
 
+// Reset logic: Only reset after position is fully closed
+// Moved above Entry Logic to prevent wiping new entries on the same bar
+if (strategy.position_size[1] != 0 and strategy.position_size == 0)
+    longStopPrice := na
+    shortStopPrice := na
+    entryPrice := na
+
 // Entry Logic
 if (longCondition)
     strategy.entry("Long", strategy.long)
@@ -91,26 +98,23 @@ if (shortCondition)
     shortStopPrice := dClosePrev * shortSLMult
     entryPrice := close
 
-// Reset logic: Only reset after position is fully closed
-if (strategy.position_size[1] != 0 and strategy.position_size == 0)
-    longStopPrice := na
-    shortStopPrice := na
-    entryPrice := na
-
-// Phase 1: Fixed Price SL
+// --- Exit / SL Logic (Directionally Decoupled) ---
+// Buy (Long) Exit Logic
 if (strategy.position_size > 0)
+    // Fixed Price SL for Long
     strategy.exit("Long SL", "Long", stop=longStopPrice, comment="Price SL")
 
-if (strategy.position_size < 0)
-    strategy.exit("Short SL", "Short", stop=shortStopPrice, comment="Price SL")
-
-// Phase 2: EMA Exit Logic (Checked at configured Exit Time)
-if (strategy.position_size > 0 and isExitTime)
-    if (dClosePrev > dEmaPrev and close < dEmaPrev)
+    // EMA Exit for Long (Checked at configured Exit Time)
+    if (isExitTime and dClosePrev > dEmaPrev and close < dEmaPrev)
         strategy.close("Long", comment="EMA Exit")
 
-if (strategy.position_size < 0 and isExitTime)
-    if (dClosePrev < dEmaPrev and close > dEmaPrev)
+// Sell (Short) Exit Logic
+if (strategy.position_size < 0)
+    // Fixed Price SL for Short
+    strategy.exit("Short SL", "Short", stop=shortStopPrice, comment="Price SL")
+
+    // EMA Exit for Short (Checked at configured Exit Time)
+    if (isExitTime and dClosePrev < dEmaPrev and close > dEmaPrev)
         strategy.close("Short", comment="EMA Exit")
 
 // --- Visuals ---
@@ -126,7 +130,8 @@ plot(strategy.position_size != 0 ? entryPrice : na, "Entry Level", color=color.n
 // Shapes (Prominent)
 plotshape(longCondition, "Long", shape.triangleup, location.belowbar, color.green, size=size.normal, text="LONG")
 plotshape(shortCondition, "Short", shape.triangledown, location.abovebar, color.red, size=size.normal, text="SHORT")
-// Fix exit shape location
+
+// Exit Marker
 exitDetected = strategy.position_size[1] != 0 and strategy.position_size == 0
 plotshape(exitDetected, "Exit", shape.xcross, location.belowbar, color.orange, size=size.small, text="EXIT", offset=-1)
 

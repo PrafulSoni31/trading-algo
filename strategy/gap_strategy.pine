@@ -7,16 +7,16 @@
 strategy("Breakout Gap Strategy", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, process_orders_on_close=true)
 
 // --- Inputs ---
-emaLen = input.int(21, "EMA Length", minval=1, help="Exponential Moving Average length for trend and exit.")
-rsiLen = input.int(10, "RSI Length", minval=1, help="RSI length calculated on the EMA.")
-rsiOB = input.int(90, "RSI Overbought", minval=50, maxval=100, help="Overbought level for potential reversal.")
-rsiOS = input.int(10, "RSI Oversold", minval=0, maxval=50, help="Oversold level for potential reversal.")
+emaLen = input.int(21, "EMA Length", minval=1, tooltip="Exponential Moving Average length for trend and exit.")
+rsiLen = input.int(10, "RSI Length", minval=1, tooltip="RSI length calculated on the EMA.")
+rsiOB = input.int(90, "RSI Overbought", minval=50, maxval=100, tooltip="Overbought level for potential reversal.")
+rsiOS = input.int(10, "RSI Oversold", minval=0, maxval=50, tooltip="Oversold level for potential reversal.")
 
 // Monthly Filter Inputs
-showMonthlyFilter = input.bool(false, "Use Monthly Filter (Conviction)", group="Monthly Filter", help="Filter trades based on Monthly EMA trend.")
+showMonthlyFilter = input.bool(false, "Use Monthly Filter (Conviction)", group="Monthly Filter", tooltip="Filter trades based on Monthly EMA trend.")
 monthlyEmaFastLen = input.int(5, "Monthly EMA Fast", minval=1, group="Monthly Filter")
 monthlyEmaSlowLen = input.int(13, "Monthly EMA Slow", minval=1, group="Monthly Filter")
-showMonthlyMacd = input.bool(false, "Use Monthly MACD Filter", group="Monthly Filter", help="Ensure Monthly MACD is positive for Longs.")
+showMonthlyMacd = input.bool(false, "Use Monthly MACD Filter", group="Monthly Filter", tooltip="Ensure Monthly MACD is positive for Longs.")
 
 // --- Calculations ---
 // Daily Indicators
@@ -71,7 +71,7 @@ shortCondition = rsiOnEma[1] > rsiOB and isGapDown and
 // --- Execution ---
 
 // Note: process_orders_on_close=true ensures that if a condition is met during the day,
-// the entry happens at the CLOSE of that same day, avoiding a one-bar lag in signals.
+// the entry happens at the CLOSE of that same day.
 
 if (longCondition)
     strategy.entry("Long", strategy.long, comment="GapUp RSI:" + str.tostring(rsiOnEma[1], "#.##"))
@@ -79,18 +79,25 @@ if (longCondition)
 if (shortCondition)
     strategy.entry("Short", strategy.short, comment="GapDn RSI:" + str.tostring(rsiOnEma[1], "#.##"))
 
-// Exit & Stop Loss Logic
+// --- Stop Loss & Exit Logic ---
+// We capture the Stop Loss price (Gap Fill level) at the time of signal.
+// This ensures the stop level stays fixed and doesn't update every bar.
+var float longStopPrice = na
+var float shortStopPrice = na
+
+if (longCondition)
+    longStopPrice := high[1]
+
+if (shortCondition)
+    shortStopPrice := low[1]
+
 if (strategy.position_size > 0)
-    // Stop Loss: Gap Fill (Previous High for Long)
-    strategy.exit("SL Long", "Long", stop=high[1], comment="SL Gap Fill")
-    // Target/Exit: Close below 21 EMA
+    strategy.exit("SL Long", "Long", stop=longStopPrice, comment="SL Gap Fill")
     if (close < emaVal)
         strategy.close("Long", comment="EMA Exit")
 
 if (strategy.position_size < 0)
-    // Stop Loss: Gap Fill (Previous Low for Short)
-    strategy.exit("SL Short", "Short", stop=low[1], comment="SL Gap Fill")
-    // Target/Exit: Close above 21 EMA
+    strategy.exit("SL Short", "Short", stop=shortStopPrice, comment="SL Gap Fill")
     if (close > emaVal)
         strategy.close("Short", comment="EMA Exit")
 

@@ -23,15 +23,25 @@ showMonthlyMacd = input.bool(false, "Use Monthly MACD Filter", group="Monthly Fi
 emaVal = ta.ema(close, emaLen)
 rsiOnEma = ta.rsi(emaVal, rsiLen)
 
-// Monthly Indicators
-// Fetching the values from the PREVIOUS month's close to avoid lookahead bias.
-// [1] refers to the completed previous month bar.
-[mEmaFast, mEmaSlow, mMacdLine, mSignalLine] = request.security(syminfo.tickerid, "M",
-     [ta.ema(close, monthlyEmaFastLen)[1],
-      ta.ema(close, monthlyEmaSlowLen)[1],
-      ta.macd(close, 12, 26, 9)[0][1],
-      ta.macd(close, 12, 26, 9)[1][1]],
-     lookahead=barmerge.lookahead_off)
+// --- Monthly Indicators ---
+// We fetch monthly values using [1] offset inside request.security to get the previous month's data and avoid lookahead bias.
+
+// Monthly EMAs
+mEmaFast = request.security(syminfo.tickerid, "M", ta.ema(close, monthlyEmaFastLen)[1], lookahead=barmerge.lookahead_off)
+mEmaSlow = request.security(syminfo.tickerid, "M", ta.ema(close, monthlyEmaSlowLen)[1], lookahead=barmerge.lookahead_off)
+
+// Monthly MACD
+// We define functions to get MACD components separately because tuples can't be indexed by position.
+get_macd_line() =>
+    [m, _, _] = ta.macd(close, 12, 26, 9)
+    m
+
+get_signal_line() =>
+    [_, s, _] = ta.macd(close, 12, 26, 9)
+    s
+
+mMacdLine = request.security(syminfo.tickerid, "M", get_macd_line()[1], lookahead=barmerge.lookahead_off)
+mSignalLine = request.security(syminfo.tickerid, "M", get_signal_line()[1], lookahead=barmerge.lookahead_off)
 
 mTrendUp = mEmaFast > mEmaSlow
 mMacdPositive = mMacdLine > mSignalLine

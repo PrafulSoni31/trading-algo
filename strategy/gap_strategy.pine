@@ -1,0 +1,100 @@
+//@version=5
+// Strategy based on YouTube transcript: Breakout Gap Strategy
+// Parameters: 21 EMA, 10 RSI on EMA, 90/10 Overbought/Oversold levels.
+// Entry: Gap Up after RSI Oversold OR Gap Down after RSI Overbought.
+// Exit: Price crosses 21 EMA or Gap is filled (Stop Loss).
+
+strategy("Breakout Gap Strategy", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, process_orders_on_close=true)
+
+// --- Inputs ---
+emaLen = input.int(21, "EMA Length", minval=1, help="Exponential Moving Average length for trend and exit.")
+rsiLen = input.int(10, "RSI Length", minval=1, help="RSI length calculated on the EMA.")
+rsiOB = input.int(90, "RSI Overbought", minval=50, maxval=100, help="Overbought level for potential reversal.")
+rsiOS = input.int(10, "RSI Oversold", minval=0, maxval=50, help="Oversold level for potential reversal.")
+
+// Monthly Filter Inputs
+showMonthlyFilter = input.bool(false, "Use Monthly Filter (Conviction)", group="Monthly Filter", help="Filter trades based on Monthly EMA trend.")
+monthlyEmaFastLen = input.int(5, "Monthly EMA Fast", minval=1, group="Monthly Filter")
+monthlyEmaSlowLen = input.int(13, "Monthly EMA Slow", minval=1, group="Monthly Filter")
+showMonthlyMacd = input.bool(false, "Use Monthly MACD Filter", group="Monthly Filter", help="Ensure Monthly MACD is positive for Longs.")
+
+// --- Calculations ---
+// Daily Indicators
+emaVal = ta.ema(close, emaLen)
+rsiOnEma = ta.rsi(emaVal, rsiLen)
+
+// Monthly Indicators
+// Fetching the values from the PREVIOUS month's close to avoid lookahead bias.
+// [1] refers to the completed previous month bar.
+[mEmaFast, mEmaSlow, mMacdLine, mSignalLine] = request.security(syminfo.tickerid, "M",
+     [ta.ema(close, monthlyEmaFastLen)[1],
+      ta.ema(close, monthlyEmaSlowLen)[1],
+      ta.macd(close, 12, 26, 9)[0][1],
+      ta.macd(close, 12, 26, 9)[1][1]],
+     lookahead=barmerge.lookahead_off)
+
+mTrendUp = mEmaFast > mEmaSlow
+mMacdPositive = mMacdLine > mSignalLine
+
+// --- Gap Detection ---
+// Upward Gap: Current Open is above yesterday's High
+isGapUp = open > high[1]
+// Downward Gap: Current Open is below yesterday's Low
+isGapDown = open < low[1]
+
+// --- Strategy Logic ---
+
+// Long Entry Condition:
+// 1. Previous day RSI on EMA was oversold (<10)
+// 2. Today opened with an Upward Gap
+// 3. (Optional) Monthly trend is up
+longCondition = rsiOnEma[1] < rsiOS and isGapUp and
+     (not showMonthlyFilter or (mTrendUp and (not showMonthlyMacd or mMacdPositive)))
+
+// Short Entry Condition:
+// 1. Previous day RSI on EMA was overbought (>90)
+// 2. Today opened with a Downward Gap
+// 3. (Optional) Monthly trend is down
+shortCondition = rsiOnEma[1] > rsiOB and isGapDown and
+     (not showMonthlyFilter or (not mTrendUp and (not showMonthlyMacd or not mMacdPositive)))
+
+// --- Execution ---
+
+// Note: process_orders_on_close=true ensures that if a condition is met during the day,
+// the entry happens at the CLOSE of that same day, avoiding a one-bar lag in signals.
+
+if (longCondition)
+    strategy.entry("Long", strategy.long, comment="GapUp RSI:" + str.tostring(rsiOnEma[1], "#.##"))
+
+if (shortCondition)
+    strategy.entry("Short", strategy.short, comment="GapDn RSI:" + str.tostring(rsiOnEma[1], "#.##"))
+
+// Exit & Stop Loss Logic
+if (strategy.position_size > 0)
+    // Stop Loss: Gap Fill (Previous High for Long)
+    strategy.exit("SL Long", "Long", stop=high[1], comment="SL Gap Fill")
+    // Target/Exit: Close below 21 EMA
+    if (close < emaVal)
+        strategy.close("Long", comment="EMA Exit")
+
+if (strategy.position_size < 0)
+    // Stop Loss: Gap Fill (Previous Low for Short)
+    strategy.exit("SL Short", "Short", stop=low[1], comment="SL Gap Fill")
+    // Target/Exit: Close above 21 EMA
+    if (close > emaVal)
+        strategy.close("Short", comment="EMA Exit")
+
+// --- Visuals ---
+plot(emaVal, color=color.new(color.white, 0), linewidth=2, title="21 Day EMA")
+
+// Plot signals on chart
+plotshape(longCondition, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, title="Long Entry Signal")
+plotshape(shortCondition, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, title="Short Entry Signal")
+
+// Highlight Gaps
+bgcolor(isGapUp ? color.new(color.green, 90) : na)
+bgcolor(isGapDown ? color.new(color.red, 90) : na)
+
+// Alerts
+alertcondition(longCondition, title="Gap Long Alert", message="RSI Oversold + Gap Up detected!")
+alertcondition(shortCondition, title="Gap Short Alert", message="RSI Overbought + Gap Down detected!")

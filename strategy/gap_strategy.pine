@@ -122,21 +122,21 @@ if (strategy.position_size < 0)
 emaToPlot = timeframe.isdaily ? dEmaCurr : dEmaPrev
 plot(emaToPlot, "Daily EMA 21", color=color.new(color.white, 50), linewidth=2)
 
-// Stop Loss & Entry plots
-plot(strategy.position_size > 0 ? longStopPrice : na, "Long SL", color=color.red, style=plot.style_linebr, linewidth=2)
-plot(strategy.position_size < 0 ? shortStopPrice : na, "Short SL", color=color.red, style=plot.style_linebr, linewidth=2)
-plot(strategy.position_size != 0 ? entryPrice : na, "Entry Level", color=color.new(color.blue, 50), style=plot.style_linebr)
+// Stop Loss & Entry plots (Only on Daily chart)
+plot(timeframe.isdaily and strategy.position_size > 0 ? longStopPrice : na, "Long SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(timeframe.isdaily and strategy.position_size < 0 ? shortStopPrice : na, "Short SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(timeframe.isdaily and strategy.position_size != 0 ? entryPrice : na, "Entry Level", color=color.new(color.blue, 50), style=plot.style_linebr)
 
-// Shapes (Prominent)
-plotshape(longCondition, "Long", shape.triangleup, location.belowbar, color.green, size=size.normal, text="LONG")
-plotshape(shortCondition, "Short", shape.triangledown, location.abovebar, color.red, size=size.normal, text="SHORT")
+// Shapes (Prominent, Only on Daily chart)
+plotshape(timeframe.isdaily and longCondition, "Long", shape.triangleup, location.belowbar, color.green, size=size.normal, text="LONG")
+plotshape(timeframe.isdaily and shortCondition, "Short", shape.triangledown, location.abovebar, color.red, size=size.normal, text="SHORT")
 
-// Exit Marker
+// Exit Marker (Only on Daily chart)
 exitDetected = strategy.position_size[1] != 0 and strategy.position_size == 0
-plotshape(exitDetected, "Exit", shape.xcross, location.belowbar, color.orange, size=size.small, text="EXIT", offset=-1)
+plotshape(timeframe.isdaily and exitDetected, "Exit", shape.xcross, location.belowbar, color.orange, size=size.small, text="EXIT", offset=-1)
 
-// Information Label
-if (barstate.islast)
+// Information Label (Only on Daily chart)
+if (barstate.islast and timeframe.isdaily)
     var label infoLabel = label.new(bar_index, high, "", color=color.new(color.blue, 50), textcolor=color.white, style=label.style_label_left)
 
     changeAbs = close - dClosePrev

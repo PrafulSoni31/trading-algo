@@ -1,11 +1,21 @@
 //@version=5
-strategy("Gap Strategy (Daily & Intraday)", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+strategy("Gap Strategy (Configurable Timing)", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
 
 // --- Inputs ---
+// Timing Inputs
+entryHour = input.int(9, "Entry Hour", minval=0, maxval=23)
+entryMinute = input.int(20, "Entry Minute", minval=0, maxval=59)
+exitHour = input.int(15, "Exit Hour", minval=0, maxval=23)
+exitMinute = input.int(27, "Exit Minute", minval=0, maxval=59)
+
+// Strategy Parameters
 rsiLen = input.int(10, "RSI Length")
 emaLen = input.int(21, "EMA Length")
 rsiOS = input.int(10, "RSI OverSold Level")
 rsiOB = input.int(90, "RSI OverBought Level")
+
+buyBelowEMA = input.bool(true, "Long Entry must be below EMA21")
+sellBelowEMA = input.bool(true, "Short Entry must be below EMA21")
 
 useMonthlyFilters = input.bool(true, "Use Monthly Trend Filters")
 monthlyEmaFastLen = input.int(5, "Monthly EMA Fast Length")
@@ -15,13 +25,11 @@ longSLMult = input.float(0.9985, "Long SL Multiplier (Prev Day Close * x)")
 shortSLMult = input.float(1.0015, "Short SL Multiplier (Prev Day Close * x)")
 
 // --- Timing Robustness ---
-// This function checks if the current bar contains or is the first bar after a target time.
-// Optimized for 1m charts as per user's 09:20/15:27 requirement.
 isTime(targetHour, targetMinute) =>
     timeframe.isdaily or (hour == targetHour and minute == targetMinute)
 
-isEntryTime = isTime(9, 20)
-isExitTime = isTime(15, 27)
+isEntryTime = isTime(entryHour, entryMinute)
+isExitTime = isTime(exitHour, exitMinute)
 
 // --- Data Fetching ---
 var float todayOpen = na
@@ -32,7 +40,7 @@ get_macd_hist() =>
     [_, _, hist] = ta.macd(close, 12, 26, 9)
     hist
 
-// Correct security calls: fetching last closed daily/monthly bar values.
+// request.security with lookahead_off returns the last finalized bar's value.
 [dEmaPrev, dHighPrev, dLowPrev, dClosePrev, dRsiOnEmaPrev] = request.security(syminfo.tickerid, "D", [ta.ema(close, emaLen), high, low, close, ta.rsi(ta.ema(close, emaLen), rsiLen)], lookahead=barmerge.lookahead_off)
 
 [mEmaFastPrev, mEmaSlowPrev, mMacdHistPrev, mClosePrev] = request.security(syminfo.tickerid, "M", [ta.ema(close, monthlyEmaFastLen), ta.ema(close, monthlyEmaSlowLen), get_macd_hist(), close], lookahead=barmerge.lookahead_off)
@@ -46,7 +54,12 @@ isGapUp = effectiveOpen > dHighPrev
 isGapDown = effectiveOpen < dLowPrev
 
 longCondition = isEntryTime and dRsiOnEmaPrev < rsiOS and isGapUp
+if (buyBelowEMA)
+    longCondition := longCondition and effectiveOpen < dEmaPrev
+
 shortCondition = isEntryTime and dRsiOnEmaPrev > rsiOB and isGapDown
+if (sellBelowEMA)
+    shortCondition := shortCondition and effectiveOpen < dEmaPrev
 
 if (useMonthlyFilters)
     longCondition := longCondition and mTrendBull
@@ -55,46 +68,60 @@ if (useMonthlyFilters)
 // --- Strategy Execution ---
 var float longStopPrice = na
 var float shortStopPrice = na
+var float entryPrice = na
 
-// Entry
+// Entry Logic
 if (longCondition)
     strategy.entry("Long", strategy.long)
     longStopPrice := dClosePrev * longSLMult
+    entryPrice := close
 
 if (shortCondition)
     strategy.entry("Short", strategy.short)
     shortStopPrice := dClosePrev * shortSLMult
+    entryPrice := close
 
-// Phase 1: Fixed Price SL (Active immediately)
+// Reset logic fixed: Only reset when we have transitioned from in-position to out-of-position
+if (strategy.position_size[1] != 0 and strategy.position_size == 0)
+    longStopPrice := na
+    shortStopPrice := na
+    entryPrice := na
+
+// Phase 1: Fixed Price SL
 if (strategy.position_size > 0)
     strategy.exit("Long SL", "Long", stop=longStopPrice, comment="Price SL")
 
 if (strategy.position_size < 0)
     strategy.exit("Short SL", "Short", stop=shortStopPrice, comment="Price SL")
 
-// Phase 2: EMA Exit Logic (Check at 15:27)
-// Long Exit: Prev Day Close > EMA and Current Price < EMA
+// Phase 2: EMA Exit Logic
 if (strategy.position_size > 0 and isExitTime)
     if (dClosePrev > dEmaPrev and close < dEmaPrev)
-        strategy.close("Long", comment="EMA Exit 15:27")
+        strategy.close("Long", comment="EMA Exit")
 
-// Short Exit: Prev Day Close < EMA and Current Price > EMA
 if (strategy.position_size < 0 and isExitTime)
     if (dClosePrev < dEmaPrev and close > dEmaPrev)
-        strategy.close("Short", comment="EMA Exit 15:27")
-
-// Reset
-if (strategy.position_size == 0)
-    longStopPrice := na
-    shortStopPrice := na
+        strategy.close("Short", comment="EMA Exit")
 
 // --- Visuals ---
-plot(dEmaPrev, "Prev Day EMA 21", color=color.white, linewidth=2)
+// Daily EMA Plot
+plot(dEmaPrev, "Prev Day EMA 21", color=color.new(color.white, 50), linewidth=2)
 
-plotshape(longCondition, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
-plotshape(shortCondition, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
+// Stop Loss Plots
+plot(strategy.position_size > 0 ? longStopPrice : na, "Long SL Level", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(strategy.position_size < 0 ? shortStopPrice : na, "Short SL Level", color=color.red, style=plot.style_linebr, linewidth=2)
 
-// Labels
+// Entry Price Plot
+plot(strategy.position_size != 0 ? entryPrice : na, "Entry Price", color=color.new(color.blue, 50), style=plot.style_linebr, linewidth=1)
+
+// Signals (Visible on Daily chart)
+plotshape(longCondition, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.normal, text="LONG")
+plotshape(shortCondition, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.normal, text="SHORT")
+
+// Exit Marker
+plotshape(strategy.position_size[1] != 0 and strategy.position_size == 0, "Exit Signal", shape.xcross, location.absolute, color.orange, size=size.small, text="EXIT")
+
+// Information Label
 if (barstate.islast)
     var label infoLabel = label.new(bar_index, high, "", color=color.new(color.blue, 50), textcolor=color.white, style=label.style_label_left)
 
@@ -107,7 +134,8 @@ if (barstate.islast)
                  "\nPrev High: " + str.tostring(dHighPrev, "#.##") +
                  "\nPrev RSI on EMA: " + str.tostring(dRsiOnEmaPrev, "#.##") +
                  "\nMonthly Trend: " + (mTrendBull ? "Bullish" : (mTrendBear ? "Bearish" : "Neutral")) +
-                 "\nPrecision: Use 1m chart"
+                 "\nConfigured Entry: " + str.tostring(entryHour, "00") + ":" + str.tostring(entryMinute, "00") +
+                 "\nConfigured Exit: " + str.tostring(exitHour, "00") + ":" + str.tostring(exitMinute, "00")
 
     label.set_text(infoLabel, labelText)
     label.set_xy(infoLabel, bar_index + 1, close)

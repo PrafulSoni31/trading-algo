@@ -1,109 +1,126 @@
 //@version=5
-// Strategy based on YouTube transcript: Breakout Gap Strategy (Refined)
-// Parameters: 21 EMA, 10 RSI on EMA, 90/10 Overbought/Oversold levels.
-// Entry: Gap Up after RSI < 10 OR Gap Down after RSI > 90.
-
-strategy("Breakout Gap Strategy", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, process_orders_on_close=true)
+strategy("Gap Strategy with RSI on EMA and Monthly Filters", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10, process_orders_on_close=true)
 
 // --- Inputs ---
-emaLen = input.int(21, "EMA Length", minval=1, tooltip="Exponential Moving Average length for trend and exit.")
-rsiLen = input.int(10, "RSI Length", minval=1, tooltip="RSI length calculated on the EMA.")
-rsiOB = input.int(90, "RSI Overbought", minval=50, maxval=100)
-rsiOS = input.int(10, "RSI Oversold", minval=0, maxval=50)
+// RSI on EMA Settings
+rsiLen = input.int(10, "RSI Length", tooltip="Standard RSI length as per transcript.")
+emaLen = input.int(21, "EMA Length", tooltip="21-day Exponential Moving Average.")
+rsiOS = input.int(10, "RSI OverSold Level", tooltip="Entry threshold for long trades.")
+rsiOB = input.int(90, "RSI OverBought Level", tooltip="Entry threshold for short trades.")
 
-// Monthly Filter Inputs
-showMonthlyFilter = input.bool(false, "Use Monthly Filter (Conviction)", group="Monthly Filter", tooltip="Filter trades based on Monthly EMA trend.")
-monthlyEmaFastLen = input.int(5, "Monthly EMA Fast", minval=1, group="Monthly Filter")
-monthlyEmaSlowLen = input.int(13, "Monthly EMA Slow", minval=1, group="Monthly Filter")
-showMonthlyMacd = input.bool(false, "Use Monthly MACD Filter", group="Monthly Filter", tooltip="Ensure Monthly MACD is positive for Longs.")
+// Entry Filters
+buyBelowEMA = input.bool(true, "Long Entry must be below EMA21", tooltip="Price must be below EMA21 at the time of gap up.")
+sellBelowEMA = input.bool(true, "Short Entry must be below EMA21", tooltip="Price must be below EMA21 at the time of gap down.")
+
+// Monthly Filters Settings
+useMonthlyFilters = input.bool(true, "Use Monthly Trend Filters", tooltip="Filter entries based on the previous month's trend.")
+monthlyEmaFastLen = input.int(5, "Monthly EMA Fast Length")
+monthlyEmaSlowLen = input.int(13, "Monthly EMA Slow Length")
+
+// Stop Loss Settings
+longSLMult = input.float(0.9985, "Long SL Multiplier (Prev Close * x)", tooltip="Default is 0.15% below previous close.")
+shortSLMult = input.float(1.0015, "Short SL Multiplier (Prev Close * x)", tooltip="Default is 0.15% above previous close.")
 
 // --- Calculations ---
 // Daily Indicators
 emaVal = ta.ema(close, emaLen)
 rsiOnEma = ta.rsi(emaVal, rsiLen)
 
-// --- Monthly Indicators ---
+// Monthly Indicators (Prev Month's Data to avoid lookahead)
+get_macd_hist() =>
+    [_, _, hist] = ta.macd(close, 12, 26, 9)
+    hist
+
 mEmaFast = request.security(syminfo.tickerid, "M", ta.ema(close, monthlyEmaFastLen)[1], lookahead=barmerge.lookahead_off)
 mEmaSlow = request.security(syminfo.tickerid, "M", ta.ema(close, monthlyEmaSlowLen)[1], lookahead=barmerge.lookahead_off)
+mMacdHist = request.security(syminfo.tickerid, "M", get_macd_hist()[1], lookahead=barmerge.lookahead_off)
+mClose = request.security(syminfo.tickerid, "M", close[1], lookahead=barmerge.lookahead_off)
 
-get_macd_line() =>
-    [m, _, _] = ta.macd(close, 12, 26, 9)
-    m
-get_signal_line() =>
-    [_, s, _] = ta.macd(close, 12, 26, 9)
-    s
+mTrendBull = mClose > mEmaFast and mEmaFast > mEmaSlow and mMacdHist > 0
+mTrendBear = mClose < mEmaFast and mEmaFast < mEmaSlow and mMacdHist < 0
 
-mMacdLine = request.security(syminfo.tickerid, "M", get_macd_line()[1], lookahead=barmerge.lookahead_off)
-mSignalLine = request.security(syminfo.tickerid, "M", get_signal_line()[1], lookahead=barmerge.lookahead_off)
-
-mTrendUp = mEmaFast > mEmaSlow
-mMacdPositive = mMacdLine > mSignalLine
-
-// --- Gap Detection ---
+// Gap Detection
 isGapUp = open > high[1]
 isGapDown = open < low[1]
 
-// --- Strategy Logic ---
+// --- Entry Conditions ---
+longCondition = rsiOnEma[1] < rsiOS and isGapUp
+if (buyBelowEMA)
+    longCondition := longCondition and open < emaVal
+if (useMonthlyFilters)
+    longCondition := longCondition and mTrendBull
 
-// Long Entry: RSI < 10 + Gap Up
-longCondition = rsiOnEma[1] < rsiOS and isGapUp and
-     (not showMonthlyFilter or (mTrendUp and (not showMonthlyMacd or mMacdPositive)))
+shortCondition = rsiOnEma[1] > rsiOB and isGapDown
+if (sellBelowEMA)
+    shortCondition := shortCondition and open < emaVal
+if (useMonthlyFilters)
+    shortCondition := shortCondition and mTrendBear
 
-// Short Entry: RSI > 90 + Gap Down
-shortCondition = rsiOnEma[1] > rsiOB and isGapDown and
-     (not showMonthlyFilter or (not mTrendUp and (not showMonthlyMacd or not mMacdPositive)))
+// --- Strategy Execution ---
+var float longStopPrice = na
+var float shortStopPrice = na
+var bool hasClosedAboveEMA = false
+var bool hasClosedBelowEMA = false
 
-// --- Execution ---
+// Reset flags on new position
+if (strategy.position_size == 0)
+    hasClosedAboveEMA := false
+    hasClosedBelowEMA := false
+    longStopPrice := na
+    shortStopPrice := na
+
+// Entry
 if (longCondition)
-    strategy.entry("Long", strategy.long, comment="RSI:" + str.tostring(rsiOnEma[1], "#.##"))
+    strategy.entry("Long", strategy.long)
+    longStopPrice := close[1] * longSLMult
 
 if (shortCondition)
-    strategy.entry("Short", strategy.short, comment="RSI:" + str.tostring(rsiOnEma[1], "#.##"))
+    strategy.entry("Short", strategy.short)
+    shortStopPrice := close[1] * shortSLMult
 
-// --- Refined Stop Loss & Exit Logic ---
-
-// Phase Tracking: Has the price closed on the "right" side of EMA since entry?
-var bool longHasClosedAboveEMA = false
-var bool shortHasClosedBelowEMA = false
-
-if (strategy.position_size <= 0)
-    longHasClosedAboveEMA := false
-if (strategy.position_size >= 0)
-    shortHasClosedBelowEMA := false
-
-// Update phase if close is on the right side
-if (strategy.position_size > 0 and close > emaVal)
-    longHasClosedAboveEMA := true
-if (strategy.position_size < 0 and close < emaVal)
-    shortHasClosedBelowEMA := true
-
-// Stop Loss Prices (Previous Day Close * Multiplier)
-longStopPrice = close[1] * 0.9985
-shortStopPrice = close[1] * 1.0015
-
-// Apply SLs
+// Phase 2 Logic: Check for first close on the correct side
 if (strategy.position_size > 0)
-    // 1. Intraday Stop (Always active)
-    strategy.exit("Price SL", "Long", stop=longStopPrice, comment="SL Price Breach")
+    if (close > emaVal)
+        hasClosedAboveEMA := true
 
-    // 2. EMA Close Stop (Only active after Phase 2)
-    if (longHasClosedAboveEMA and close < emaVal)
-        strategy.close("Long", comment="SL EMA Close")
+    // Exit Phase 1: Price SL
+    strategy.exit("Long SL", "Long", stop=longStopPrice, comment="Price SL")
+
+    // Exit Phase 2: EMA Close
+    if (hasClosedAboveEMA and close < emaVal)
+        strategy.close("Long", comment="EMA Cross Exit")
 
 if (strategy.position_size < 0)
-    // 1. Intraday Stop (Always active)
-    strategy.exit("Price SL", "Short", stop=shortStopPrice, comment="SL Price Breach")
+    if (close < emaVal)
+        hasClosedBelowEMA := true
 
-    // 2. EMA Close Stop (Only active after Phase 2)
-    if (shortHasClosedBelowEMA and close > emaVal)
-        strategy.close("Short", comment="SL EMA Close")
+    // Exit Phase 1: Price SL
+    strategy.exit("Short SL", "Short", stop=shortStopPrice, comment="Price SL")
+
+    // Exit Phase 2: EMA Close
+    if (hasClosedBelowEMA and close > emaVal)
+        strategy.close("Short", comment="EMA Cross Exit")
 
 // --- Visuals ---
-plot(emaVal, color=color.new(color.white, 0), linewidth=2, title="21 Day EMA")
-plot(strategy.position_size > 0 ? longStopPrice : na, color=color.new(color.red, 50), style=plot.style_linebr, title="Long Stop Price")
-plot(strategy.position_size < 0 ? shortStopPrice : na, color=color.new(color.red, 50), style=plot.style_linebr, title="Short Stop Price")
+plot(emaVal, "EMA 21", color=color.white)
+// Optional: plot RSI on a separate pane if needed, but here we just plot indicators on chart
+plot(rsiOnEma, "RSI on EMA", color=color.yellow, display=display.none)
 
-plotshape(longCondition, style=shape.triangleup, location=location.belowbar, color=color.green, size=size.small, title="Long Entry Signal")
-plotshape(shortCondition, style=shape.triangledown, location=location.abovebar, color=color.red, size=size.small, title="Short Entry Signal")
-bgcolor(isGapUp ? color.new(color.green, 90) : na, title="Gap Up Background")
-bgcolor(isGapDown ? color.new(color.red, 90) : na, title="Gap Down Background")
+plotshape(longCondition, "Long Signal", shape.triangleup, location.belowbar, color.green, size=size.small)
+plotshape(shortCondition, "Short Signal", shape.triangledown, location.abovebar, color.red, size=size.small)
+
+// Labels for transparency and user requested format
+if (barstate.islast)
+    var label infoLabel = label.new(bar_index, high, "", color=color.new(color.blue, 50), textcolor=color.white, style=label.style_label_left)
+
+    changeAbs = close - close[1]
+    changePct = (changeAbs / close[1]) * 100
+    changeStr = str.tostring(changePct, "#.##") + "% (" + str.tostring(changeAbs, "#.##") + ")"
+
+    labelText = "Current Change: " + changeStr +
+                 "\nRSI on EMA: " + str.tostring(rsiOnEma, "#.##") +
+                 "\nMonthly Trend Bull: " + str.tostring(mTrendBull) +
+                 "\nMonthly Trend Bear: " + str.tostring(mTrendBear)
+
+    label.set_text(infoLabel, labelText)
+    label.set_xy(infoLabel, bar_index + 1, close)

@@ -14,8 +14,8 @@ emaLen = input.int(21, "Daily EMA Length")
 rsiOS = input.int(10, "RSI OverSold Level")
 rsiOB = input.int(90, "RSI OverBought Level")
 
-// Gap Logic Input
-gapType = input.string("Partial Gap (Open vs Close)", "Gap Detection Type", options=["Full Gap (Open vs High/Low)", "Partial Gap (Open vs Close)"])
+// Gap Logic Input - Set default to Full Gap as per user's latest request
+gapType = input.string("Full Gap (Open vs High/Low)", "Gap Detection Type", options=["Full Gap (Open vs High/Low)", "Partial Gap (Open vs Close)"])
 
 // Entry Filters (Set to false by default as they can block valid reversal trades)
 buyBelowEMA = input.bool(false, "Long Entry must be below Daily EMA21")
@@ -60,6 +60,8 @@ mTrendBear = mClosePrev < mEmaFastPrev and mEmaFastPrev < mEmaSlowPrev and mMacd
 effectiveOpen = timeframe.isdaily ? open : todayOpen
 
 // Gap Logic based on Input
+// Buy: current day open > previous day high (Full Gap)
+// Sell: current day open < previous day low (Full Gap)
 isGapUp = gapType == "Full Gap (Open vs High/Low)" ? effectiveOpen > dHighPrev : effectiveOpen > dClosePrev
 isGapDown = gapType == "Full Gap (Open vs High/Low)" ? effectiveOpen < dLowPrev : effectiveOpen < dClosePrev
 
@@ -81,7 +83,6 @@ var float shortStopPrice = na
 var float entryPrice = na
 
 // Reset logic: Only reset after position is fully closed
-// Moved above Entry Logic to prevent wiping new entries on the same bar
 if (strategy.position_size[1] != 0 and strategy.position_size == 0)
     longStopPrice := na
     shortStopPrice := na
@@ -118,7 +119,6 @@ if (strategy.position_size < 0)
         strategy.close("Short", comment="EMA Exit")
 
 // --- Visuals ---
-// Plot current EMA on Daily chart, or prev EMA on Intraday
 emaToPlot = timeframe.isdaily ? dEmaCurr : dEmaPrev
 plot(emaToPlot, "Daily EMA 21", color=color.new(color.white, 50), linewidth=2)
 

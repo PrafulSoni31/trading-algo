@@ -19,7 +19,7 @@ gapType = input.string("Full Gap (Open vs High/Low)", "Gap Detection Type", opti
 
 // Entry Filters (Set to false by default as they can block valid reversal trades)
 buyBelowEMA = input.bool(false, "Long Entry must be below Daily EMA21")
-sellBelowEMA = input.bool(false, "Short Entry must be below Daily EMA21")
+sellAboveEMA = input.bool(false, "Short Entry must be above Daily EMA21")
 
 useMonthlyFilters = input.bool(true, "Use Monthly Trend Filters")
 monthlyEmaFastLen = input.int(5, "Monthly EMA Fast Length")
@@ -70,8 +70,8 @@ if (buyBelowEMA)
     longCondition := longCondition and effectiveOpen < dEmaPrev
 
 shortCondition = isEntryTime and dRsiOnEmaPrev > rsiOB and isGapDown
-if (sellBelowEMA)
-    shortCondition := shortCondition and effectiveOpen < dEmaPrev
+if (sellAboveEMA)
+    shortCondition := shortCondition and effectiveOpen > dEmaPrev
 
 if (useMonthlyFilters)
     longCondition := longCondition and mTrendBull

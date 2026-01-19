@@ -21,6 +21,8 @@ gapType = input.string("Full Gap (Open vs High/Low)", "Gap Detection Type", opti
 buyBelowEMA = input.bool(false, "Long Entry must be below Daily EMA21")
 sellAboveEMA = input.bool(false, "Short Entry must be above Daily EMA21")
 
+useEmaExit = input.bool(true, "Use EMA Reversal Exit (at 15:27)")
+
 useMonthlyFilters = input.bool(false, "Use Monthly Trend Filters (Strict)")
 monthlyEmaFastLen = input.int(5, "Monthly EMA Fast Length")
 monthlyEmaSlowLen = input.int(13, "Monthly EMA Slow Length")
@@ -103,12 +105,15 @@ if shortCondition and strategy.position_size == 0
 // --- Exit Logic ---
 if strategy.position_size > 0
     strategy.exit("SL Long", "Long", stop=longStopPrice, comment="Stop Loss")
-    if (isExitTime and dClosePrev > dEmaPrev and close < dEmaCurr)
+    // Exit if price closes below Daily EMA (checked at exit time)
+    // Requirement: previous day close was above EMA, and current price is below EMA
+    if (useEmaExit and isExitTime and dClosePrev > dEmaPrev and close < dEmaCurr)
         strategy.close("Long", comment="EMA Exit")
 
 if strategy.position_size < 0
     strategy.exit("SL Short", "Short", stop=shortStopPrice, comment="Stop Loss")
-    if (isExitTime and dClosePrev < dEmaPrev and close > dEmaCurr)
+    // Requirement: previous day close was below EMA, and current price is above EMA
+    if (useEmaExit and isExitTime and dClosePrev < dEmaPrev and close > dEmaCurr)
         strategy.close("Short", comment="EMA Exit")
 
 // --- Visuals ---

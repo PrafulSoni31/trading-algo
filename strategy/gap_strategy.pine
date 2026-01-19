@@ -1,0 +1,181 @@
+//@version=5
+strategy("Gap Strategy (Daily Indicators V5)", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
+
+// Note: This strategy is optimized for Intraday timeframes (e.g., 5m, 15m) to capture 09:20 entries.
+// If run on Daily timeframe, entries will execute on the bar AFTER the signal is detected.
+
+// --- Inputs ---
+// Timing Inputs
+entryHour = input.int(9, "Entry Hour", minval=0, maxval=23)
+entryMinute = input.int(20, "Entry Minute", minval=0, maxval=59)
+exitHour = input.int(15, "Exit Hour", minval=0, maxval=23)
+exitMinute = input.int(27, "Exit Minute", minval=0, maxval=59)
+
+// Strategy Parameters (Daily)
+rsiLen = input.int(10, "Daily RSI Length")
+emaLen = input.int(21, "Daily EMA Length")
+rsiOS = input.int(10, "RSI OverSold Level")
+rsiOB = input.int(90, "RSI OverBought Level")
+
+// Gap Logic Input
+gapType = input.string("Full Gap (Open vs High/Low)", "Gap Detection Type", options=["Full Gap (Open vs High/Low)", "Partial Gap (Open vs Close)"])
+
+// Entry Filters
+buyBelowEMA = input.bool(false, "Long Entry must be below Daily EMA21")
+sellAboveEMA = input.bool(false, "Short Entry must be above Daily EMA21")
+
+useMonthlyFilters = input.bool(false, "Use Monthly Trend Filters (Strict)")
+monthlyEmaFastLen = input.int(5, "Monthly EMA Fast Length")
+monthlyEmaSlowLen = input.int(13, "Monthly EMA Slow Length")
+
+// SL Parameters
+longSLMult = input.float(0.9985, "Long SL Multiplier (Prev Close * x)", step=0.0001)
+shortSLMult = input.float(1.0015, "Short SL Multiplier (Prev Close * x)", step=0.0001)
+
+// --- Daily Indicator Calculation (for request.security) ---
+dEma_raw = ta.ema(close, emaLen)
+dRsiOnEma_raw = ta.rsi(dEma_raw, rsiLen)
+
+// --- Data Fetching (Daily) ---
+// We fetch data from the LAST CLOSED Daily bar.
+// On Intraday charts: this returns data from the day before today.
+// On Daily charts: this returns data from the bar preceding the current one.
+[dHighPrev, dLowPrev, dClosePrev, dEmaPrev, dRsiPrev] = request.security(syminfo.tickerid, "D", [high[1], low[1], close[1], dEma_raw[1], dRsiOnEma_raw[1]], lookahead=barmerge.lookahead_off)
+
+// Today's Open (for Gap calculation)
+var float todayOpen = na
+if timeframe.isdaily
+    todayOpen := open
+else
+    if ta.change(time("D"))
+        todayOpen := open
+
+// Current Daily EMA (for Exit logic)
+float dEmaCurr = na
+if timeframe.isdaily
+    dEmaCurr := dEma_raw
+else
+    alpha = 2.0 / (emaLen + 1.0)
+    dEmaCurr := (close * alpha) + (dEmaPrev * (1.0 - alpha))
+
+// --- Data Fetching (Monthly) ---
+get_macd_hist() =>
+    [_, _, hist] = ta.macd(close, 12, 26, 9)
+    hist
+
+[mEmaFastPrev, mEmaSlowPrev, mMacdHistPrev, mClosePrev] = request.security(syminfo.tickerid, "M", [ta.ema(close, monthlyEmaFastLen)[1], ta.ema(close, monthlyEmaSlowLen)[1], get_macd_hist()[1], close[1]], lookahead=barmerge.lookahead_off)
+
+mTrendBull = mClosePrev > mEmaFastPrev and mEmaFastPrev > mEmaSlowPrev and mMacdHistPrev > 0
+mTrendBear = mClosePrev < mEmaFastPrev and mEmaFastPrev < mEmaSlowPrev and mMacdHistPrev < 0
+
+// --- Entry Timing ---
+// Checks if current bar is the first bar that reaches or exceeds the target time
+getTargetTime(h, m) => timestamp(year, month, dayofmonth, h, m)
+
+isEntryTime = timeframe.isdaily or (time >= getTargetTime(entryHour, entryMinute) and time[1] < getTargetTime(entryHour, entryMinute))
+isExitTime = timeframe.isdaily or (time >= getTargetTime(exitHour, exitMinute) and time[1] < getTargetTime(exitHour, exitMinute))
+
+// --- Gap Logic ---
+isGapUp = gapType == "Full Gap (Open vs High/Low)" ? todayOpen > dHighPrev : todayOpen > dClosePrev
+isGapDown = gapType == "Full Gap (Open vs High/Low)" ? todayOpen < dLowPrev : todayOpen < dClosePrev
+
+// --- Conditions ---
+longCondition = isEntryTime and dRsiPrev < rsiOS and isGapUp
+     and (not buyBelowEMA or todayOpen < dEmaPrev)
+     and (not useMonthlyFilters or mTrendBull)
+
+shortCondition = isEntryTime and dRsiPrev > rsiOB and isGapDown
+     and (not sellAboveEMA or todayOpen > dEmaPrev)
+     and (not useMonthlyFilters or mTrendBear)
+
+// --- Strategy Execution ---
+var float longStopPrice = na
+var float shortStopPrice = na
+var float entryLevel = na
+
+if longCondition and strategy.position_size <= 0
+    // On intraday, this enters at 09:20. On Daily, it enters at next open.
+    strategy.entry("Long", strategy.long)
+    longStopPrice := dClosePrev * longSLMult
+    entryLevel := close
+
+if shortCondition and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+    shortStopPrice := dClosePrev * shortSLMult
+    entryLevel := close
+
+// --- Exit Logic ---
+if strategy.position_size > 0
+    strategy.exit("SL Long", "Long", stop=longStopPrice, comment="Gap Fill SL")
+    // EMA Exit Condition: At 15:27, Yesterday was above EMA, but current price is below EMA.
+    if isExitTime and dClosePrev > dEmaPrev and close < dEmaCurr
+        strategy.close("Long", comment="EMA Exit")
+
+if strategy.position_size < 0
+    strategy.exit("SL Short", "Short", stop=shortStopPrice, comment="Gap Fill SL")
+    // EMA Exit Condition: At 15:27, Yesterday was below EMA, but current price is above EMA.
+    if isExitTime and dClosePrev < dEmaPrev and close > dEmaCurr
+        strategy.close("Short", comment="EMA Exit")
+
+// --- Visuals ---
+// Daily EMA Plot
+plot(dEmaCurr, "Daily EMA 21", color=color.new(color.white, 50), linewidth=2)
+
+// Price Markers (Only on Daily chart)
+isDaily = timeframe.isdaily
+
+// Use var to persist SL lines even on the entry bar before strategy.position_size updates
+var float plotLongSL = na
+var float plotShortSL = na
+var float plotEntry = na
+
+if strategy.position_size > 0
+    plotLongSL := longStopPrice
+    plotEntry := entryLevel
+    plotShortSL := na
+else if strategy.position_size < 0
+    plotShortSL := shortStopPrice
+    plotEntry := entryLevel
+    plotLongSL := na
+else
+    // Check if we just triggered an entry this bar
+    if longCondition
+        plotLongSL := dClosePrev * longSLMult
+        plotEntry := close
+        plotShortSL := na
+    else if shortCondition
+        plotShortSL := dClosePrev * shortSLMult
+        plotEntry := close
+        plotLongSL := na
+    else
+        plotLongSL := na
+        plotShortSL := na
+        plotEntry := na
+
+plot(isDaily ? plotLongSL : na, "Long SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(isDaily ? plotShortSL : na, "Short SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(isDaily ? plotEntry : na, "Entry Level", color=color.new(color.blue, 50), style=plot.style_linebr)
+
+// Shapes (Only on Daily chart)
+plotshape(isDaily and longCondition, "Long", shape.triangleup, location.belowbar, color.green, size=size.normal, text="LONG")
+plotshape(isDaily and shortCondition, "Short", shape.triangledown, location.abovebar, color.red, size=size.normal, text="SHORT")
+
+exitDetected = strategy.position_size[1] != 0 and strategy.position_size == 0
+plotshape(isDaily and exitDetected, "Exit", shape.xcross, location.belowbar, color.orange, size=size.small, text="EXIT", offset=-1)
+
+// Information Label (Only on Daily chart)
+if isDaily and barstate.islast
+    var label infoLabel = label.new(bar_index, high, "", color=color.new(color.blue, 30), textcolor=color.white, style=label.style_label_left)
+
+    changeAbs = close - dClosePrev
+    changePct = (changeAbs / dClosePrev) * 100
+    changeStr = str.tostring(changePct, "#.##") + "% (" + str.tostring(changeAbs, "#.##") + ")"
+
+    labelText = "Status: " + (strategy.position_size > 0 ? "LONG" : (strategy.position_size < 0 ? "SHORT" : "NEUTRAL")) +
+                 "\nChange: " + changeStr +
+                 "\nRSI (Prev Close): " + str.tostring(dRsiPrev, "#.##") +
+                 "\nGap detected: " + (isGapUp ? "UP" : (isGapDown ? "DOWN" : "NONE")) +
+                 "\nMonthly Trend: " + (mTrendBull ? "Bullish" : (mTrendBear ? "Bearish" : "Neutral"))
+
+    label.set_text(infoLabel, labelText)
+    label.set_xy(infoLabel, bar_index + 1, close)

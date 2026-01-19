@@ -1,12 +1,13 @@
 //@version=5
 strategy("Gap Strategy (Daily Indicators V5)", overlay=true, initial_capital=100000, default_qty_type=strategy.percent_of_equity, default_qty_value=10)
 
+// Note: This strategy is optimized for Intraday timeframes (e.g., 5m, 15m) to capture 09:20 entries.
+// If run on Daily timeframe, entries will execute on the bar AFTER the signal is detected.
+
 // --- Inputs ---
 // Timing Inputs
 entryHour = input.int(9, "Entry Hour", minval=0, maxval=23)
 entryMinute = input.int(20, "Entry Minute", minval=0, maxval=59)
-exitHour = input.int(15, "Exit Hour", minval=0, maxval=23)
-exitMinute = input.int(27, "Exit Minute", minval=0, maxval=59)
 
 // Strategy Parameters (Daily)
 rsiLen = input.int(10, "Daily RSI Length")
@@ -21,13 +22,11 @@ gapType = input.string("Full Gap (Open vs High/Low)", "Gap Detection Type", opti
 buyBelowEMA = input.bool(false, "Long Entry must be below Daily EMA21")
 sellAboveEMA = input.bool(false, "Short Entry must be above Daily EMA21")
 
-useEmaExit = input.bool(true, "Use EMA Reversal Exit (at 15:27)")
-
 useMonthlyFilters = input.bool(false, "Use Monthly Trend Filters (Strict)")
 monthlyEmaFastLen = input.int(5, "Monthly EMA Fast Length")
 monthlyEmaSlowLen = input.int(13, "Monthly EMA Slow Length")
 
-// User-specified SL Multipliers on Previous Close
+// SL Parameters
 longSLMult = input.float(0.9985, "Long SL Multiplier (Prev Close * x)", step=0.0001)
 shortSLMult = input.float(1.0015, "Short SL Multiplier (Prev Close * x)", step=0.0001)
 
@@ -72,7 +71,6 @@ mTrendBear = mClosePrev < mEmaFastPrev and mEmaFastPrev < mEmaSlowPrev and mMacd
 getTargetTime(h, m) => timestamp(year, month, dayofmonth, h, m)
 
 isEntryTime = timeframe.isdaily or (time >= getTargetTime(entryHour, entryMinute) and time[1] < getTargetTime(entryHour, entryMinute))
-isExitTime = timeframe.isdaily or (time >= getTargetTime(exitHour, exitMinute) and time[1] < getTargetTime(exitHour, exitMinute))
 
 // --- Gap Logic ---
 isGapUp = gapType == "Full Gap (Open vs High/Low)" ? todayOpen > dHighPrev : todayOpen > dClosePrev
@@ -93,6 +91,7 @@ var float shortStopPrice = na
 var float entryLevel = na
 
 if longCondition and strategy.position_size == 0
+    // On intraday, this enters at 09:20. On Daily, it enters at next open.
     strategy.entry("Long", strategy.long)
     longStopPrice := dClosePrev * longSLMult
     entryLevel := close
@@ -104,17 +103,10 @@ if shortCondition and strategy.position_size == 0
 
 // --- Exit Logic ---
 if strategy.position_size > 0
-    strategy.exit("SL Long", "Long", stop=longStopPrice, comment="Stop Loss")
-    // Exit if price closes below Daily EMA (checked at exit time)
-    // Requirement: previous day close was above EMA, and current price is below EMA
-    if (useEmaExit and isExitTime and dClosePrev > dEmaPrev and close < dEmaCurr)
-        strategy.close("Long", comment="EMA Exit")
+    strategy.exit("SL Long", "Long", stop=longStopPrice, comment="Gap Fill SL")
 
 if strategy.position_size < 0
-    strategy.exit("SL Short", "Short", stop=shortStopPrice, comment="Stop Loss")
-    // Requirement: previous day close was below EMA, and current price is above EMA
-    if (useEmaExit and isExitTime and dClosePrev < dEmaPrev and close > dEmaCurr)
-        strategy.close("Short", comment="EMA Exit")
+    strategy.exit("SL Short", "Short", stop=shortStopPrice, comment="Gap Fill SL")
 
 // --- Visuals ---
 // Daily EMA Plot
@@ -122,9 +114,38 @@ plot(dEmaCurr, "Daily EMA 21", color=color.new(color.white, 50), linewidth=2)
 
 // Price Markers (Only on Daily chart)
 isDaily = timeframe.isdaily
-plot(isDaily and strategy.position_size > 0 ? longStopPrice : na, "Long SL", color=color.red, style=plot.style_linebr, linewidth=2)
-plot(isDaily and strategy.position_size < 0 ? shortStopPrice : na, "Short SL", color=color.red, style=plot.style_linebr, linewidth=2)
-plot(isDaily and strategy.position_size != 0 ? entryLevel : na, "Entry Level", color=color.new(color.blue, 50), style=plot.style_linebr)
+
+// Use var to persist SL lines even on the entry bar before strategy.position_size updates
+var float plotLongSL = na
+var float plotShortSL = na
+var float plotEntry = na
+
+if strategy.position_size > 0
+    plotLongSL := longStopPrice
+    plotEntry := entryLevel
+    plotShortSL := na
+else if strategy.position_size < 0
+    plotShortSL := shortStopPrice
+    plotEntry := entryLevel
+    plotLongSL := na
+else
+    // Check if we just triggered an entry this bar
+    if longCondition
+        plotLongSL := dClosePrev * longSLMult
+        plotEntry := close
+        plotShortSL := na
+    else if shortCondition
+        plotShortSL := dClosePrev * shortSLMult
+        plotEntry := close
+        plotLongSL := na
+    else
+        plotLongSL := na
+        plotShortSL := na
+        plotEntry := na
+
+plot(isDaily ? plotLongSL : na, "Long SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(isDaily ? plotShortSL : na, "Short SL", color=color.red, style=plot.style_linebr, linewidth=2)
+plot(isDaily ? plotEntry : na, "Entry Level", color=color.new(color.blue, 50), style=plot.style_linebr)
 
 // Shapes (Only on Daily chart)
 plotshape(isDaily and longCondition, "Long", shape.triangleup, location.belowbar, color.green, size=size.normal, text="LONG")
